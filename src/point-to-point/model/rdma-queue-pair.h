@@ -54,6 +54,7 @@ public:
 	static const uint8_t m_ackPriority{2};
 
 private:
+	uint64_t m_rttNs{0};
 	uint16_t m_port{0};
 
 	uint32_t m_sendSize{1400};
@@ -63,6 +64,7 @@ private:
 	DataRate m_maxRate;
 	DataRate m_minRate{100000000}; // 100 Mbps
 	DataRate m_currentRate;
+	DataRate m_increase{"0.05Gbps"};
 
 	int64_t m_lastSendTime{0};
 	int64_t m_lastGenerateTime{0};
@@ -95,6 +97,16 @@ private:
 
 	void UpdateMlxAlpha();
 	void IncreaseMlxRate();
+
+	// HPCC congestion control variables
+	uint32_t m_hpccLastSeq{0};
+	uint32_t m_hpccIncStage{0};
+	double m_hpccUtil{0.0};
+	DataRate m_hpccPrevRate{0};
+
+	std::vector<IntHeader> m_hpccHeaders;
+
+	void UpdateHpccRate(std::vector<IntHeader> newHeaders, bool fullUpdate);
 };
 
 } // namespace ns3

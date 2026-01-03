@@ -219,6 +219,9 @@ SwitchNode::IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPo
         return false;
     }
 
+    // if(m_uniformVar.GetValue(0.0, 1.0) < 0.01)
+    //    return false;
+
     // Drop check
     if((int32_t)packet->GetSize() + m_usedHdrm[dev] > m_hdrmBuffer[dev] && 
        (int32_t)packet->GetSize() + GetUsedShared(dev) > GetSharedThreshold(dev)){

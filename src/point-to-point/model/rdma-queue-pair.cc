@@ -37,8 +37,22 @@ RdmaQueuePair::RdmaQueuePair(FlowInfo flow, Ptr<PointToPointNetDevice> device, F
 	m_maxRate = device->GetDataRate();
 	m_currentRate = m_maxRate;
 	m_mlxTargetRate = m_currentRate;
+	m_hpccPrevRate = m_currentRate;
 	m_lastSendTime = 0;
 	m_lastGenerateTime = 0;
+
+	// Depends on topology
+	if(flow.src / 64 == flow.dst / 64){
+		if(flow.src / 16 == flow.dst / 16){
+			m_rttNs = 4000; // 4 us
+		}
+		else{
+			m_rttNs = 8000; // 8 us
+		}
+	}
+	else{
+		m_rttNs = 12000; // 12 us
+	}
 };
 
 int64_t 
@@ -66,12 +80,10 @@ RdmaQueuePair::TimeOutReset()
 	m_port += 1; // change port for load balancing
 	m_bytesSent = m_bytesAcked;
 	m_lastSendTime = m_lastGenerateTime = Simulator::Now().GetNanoSeconds();
-	if(m_ccVersion == 1){
+	if(m_ccVersion == 1)
 		DecreaseMlxRate();
-	}
-	if(m_pfcVersion == 1){
+	if(m_pfcVersion == 1)
 		std::cerr << "Timeout reset for flow " << m_flow.id << ", retransmitting from byte " << m_bytesSent << std::endl;
-	}
 }
 
 bool 
@@ -82,18 +94,8 @@ RdmaQueuePair::ProcessACK(BthHeader& bth_header, HpccHeader& hpcc_header)
 		return false;
 	}
 
-	if(m_ccVersion == 2){
-		// HPCC RDMA congestion control
-		std::vector<IntHeader> intHeaders = hpcc_header.GetIntHeaders();
-		std::cout << "Flow " << m_flow.id << " received HPCC INT headers from " << (uint32_t)intHeaders.size() << " hops." << std::endl;
-		for(auto& intHeader : intHeaders){
-			std::cout << "  Rate: " << intHeader.GetRate().GetBitRate() / 1e6 << " Mbps, "
-					  << "Bytes: " << intHeader.GetBytes() << ", "
-					  << "QueueLen: " << intHeader.GetQueueLen() << std::endl;
-		}
-	}
-
 	uint32_t seq = bth_header.GetSequence();
+	bool newACK = seq > m_bytesAcked;
 	m_bytesAcked = std::max(m_bytesAcked, seq);
 
 	if(bth_header.GetACK()){
@@ -123,6 +125,25 @@ RdmaQueuePair::ProcessACK(BthHeader& bth_header, HpccHeader& hpcc_header)
 		}
 	}
 
+	if(m_ccVersion == 2 && newACK){
+		// HPCC congestion control
+		if(m_hpccLastSeq == 0){
+			m_hpccLastSeq = m_bytesSent + 1;
+			m_hpccHeaders = hpcc_header.GetIntHeaders();
+			return false;
+		}
+
+		auto newHeaders = hpcc_header.GetIntHeaders();
+		if(newHeaders.size() != m_hpccHeaders.size()){
+			std::cerr << "Inconsistent number of INT headers for flow " << m_flow.id
+					  << ": previous " << m_hpccHeaders.size()
+					  << ", current " << newHeaders.size() << std::endl;
+			return false;
+		}
+
+		UpdateHpccRate(newHeaders, seq > m_hpccLastSeq);
+	}
+
 	return false;
 }
 
@@ -135,7 +156,7 @@ RdmaQueuePair::GenerateNextPacket()
 	}
 
 	/*
-	if(m_flow.id == 99999999){
+	if(m_flow.id == 1){
 		std::cerr << "Generating packet for flow " << m_flow.id << " at time " 
 			<< Simulator::Now().GetNanoSeconds() << " ns, bytes sent " << m_bytesSent << " , bytes acked " << m_bytesAcked << std::endl;
 		std::cerr << "Current rate " << m_currentRate.GetBitRate() / 1e6 << " Mbps with flow size " << m_flow.size << " bytes." << std::endl;
@@ -148,16 +169,14 @@ RdmaQueuePair::GenerateNextPacket()
 	if(m_lastSendTime != 0 && m_lastGenerateTime - m_lastSendTime > 2000000){ // 2 milliseconds
 		m_port += 1; // change port for load balancing
 		m_bytesSent = m_bytesAcked;
-		if(m_ccVersion == 1){
+		if(m_ccVersion == 1)
 			DecreaseMlxRate();
-		}
-		if(m_pfcVersion == 1){
+		if(m_pfcVersion == 1)
 			std::cerr << "Timeout detected for flow " << m_flow.id << ", retransmitting from byte " << m_bytesSent << std::endl;
-		}
 	}
 	else{
 		uint32_t inFlight = m_bytesSent - m_bytesAcked;
-		if(inFlight * 8 >= std::max(800000.0, m_currentRate.GetBitRate() * 0.0002)){ // 200 microseconds bandwidth-delay product
+		if(inFlight * 8 >= std::max(50000.0, m_currentRate.GetBitRate() * m_rttNs / 1e9)){ 
 			return nullptr;
 		}
 	}
@@ -218,15 +237,15 @@ void
 RdmaQueuePair::DecreaseMlxRate(){
 	m_mlxCnpAlpha = true;
 	// MLX congestion control
-	if(Simulator::Now().GetNanoSeconds() - m_prevCnpTime > 40000){ // 40 microseconds
+	UpdateMlxAlpha();
+	if(Simulator::Now().GetNanoSeconds() - m_prevCnpTime > 10000){ // 10 microseconds
 		m_prevCnpTime = Simulator::Now().GetNanoSeconds();
 		m_mlxTargetRate = m_currentRate;
 		m_currentRate = std::max(m_minRate, m_currentRate * (1.0 - m_mlxAlpha / 2.0));
 	}
-	UpdateMlxAlpha();
 	m_mlxTimeStage = 0;
 	Simulator::Cancel(m_mlxIncreaseRate);
-	m_mlxIncreaseRate = Simulator::Schedule(MicroSeconds(50), &RdmaQueuePair::IncreaseMlxRate, this);
+	m_mlxIncreaseRate = Simulator::Schedule(MicroSeconds(100), &RdmaQueuePair::IncreaseMlxRate, this);
 }
 
 void
@@ -239,18 +258,69 @@ RdmaQueuePair::UpdateMlxAlpha(){
 		m_mlxAlpha = (1 - m_mlxG) * m_mlxAlpha;
 	}
 	m_mlxCnpAlpha = false;
-	m_mlxUpdateAlpha = Simulator::Schedule(MicroSeconds(45), &RdmaQueuePair::UpdateMlxAlpha, this);
+	m_mlxUpdateAlpha = Simulator::Schedule(MicroSeconds(9), &RdmaQueuePair::UpdateMlxAlpha, this);
 }
 
 void
 RdmaQueuePair::IncreaseMlxRate(){
 	Simulator::Cancel(m_mlxIncreaseRate);
-	if(m_mlxTimeStage > 0){
-		m_mlxTargetRate = std::min(m_maxRate, m_mlxTargetRate + DataRate("0.1Gbps")); // increase by 0.1 Gbps
-	}
+	if(m_mlxTimeStage > 0)
+		m_mlxTargetRate = std::min(m_maxRate, m_mlxTargetRate + m_increase);
 	m_currentRate = (m_mlxTargetRate + m_currentRate) * 0.5;
 	m_mlxTimeStage += 1;
-	m_mlxIncreaseRate = Simulator::Schedule(MicroSeconds(50), &RdmaQueuePair::IncreaseMlxRate, this);
+	m_mlxIncreaseRate = Simulator::Schedule(MicroSeconds(100), &RdmaQueuePair::IncreaseMlxRate, this);
+}
+
+void 
+RdmaQueuePair::UpdateHpccRate(std::vector<IntHeader> newHeaders, bool fullUpdate){
+	double Util = 0;
+	uint64_t dt = 0;
+	for(uint32_t i = 0;i < newHeaders.size();++i){
+		auto& newHeader = newHeaders[i];
+		auto& oldHeader = m_hpccHeaders[i];
+
+		uint64_t tau = newHeader.GetTimeDelta(oldHeader);
+		double duration = tau * 1e-9; // in seconds
+		uint64_t bytes = newHeader.GetBytesDelta(oldHeader);
+		double txRate = bytes * 8.0 / duration; // in bps
+		double util = txRate / newHeader.GetRate().GetBitRate() +
+			std::min(newHeader.GetQueueLen(), oldHeader.GetQueueLen()) / (m_rttNs * 1e-9) / m_maxRate.GetBitRate();
+		
+		if(util > Util){
+			Util = util;
+			dt = tau;
+		}
+		m_hpccHeaders[i] = newHeader;
+	}
+
+	DataRate newRate;
+	int32_t newIncStage;
+
+	dt = std::min(dt, m_rttNs);
+
+	// std::cout << m_hpccUtil << " " << Util << " " << std::endl;
+	m_hpccUtil = m_hpccUtil * (1.0 - dt / (double)m_rttNs) + Util * (dt / (double)m_rttNs);
+	double maxC = m_hpccUtil / 0.95;
+
+	if(maxC >= 1 || m_hpccIncStage >= 4){
+		newRate = m_hpccPrevRate * (1.0 / maxC) + m_increase;
+		newIncStage = 0;
+	}
+	else{
+		newRate = m_hpccPrevRate + m_increase;
+		newIncStage = m_hpccIncStage + 1;
+	}
+
+	newRate = std::min(newRate, m_maxRate);
+	newRate = std::max(newRate, m_minRate);
+
+	m_currentRate = newRate;
+
+	if(fullUpdate){
+		m_hpccPrevRate = newRate;
+		m_hpccIncStage = newIncStage;
+		m_hpccLastSeq = m_bytesSent + 1;
+	}
 }
 
 } // namespace ns3

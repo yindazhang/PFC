@@ -434,14 +434,16 @@ PointToPointNetDevice::Receive(Ptr<Packet> packet)
             }
             else{
                 if(bth_header.GetSequence() <= m_receivers[id] + bth_header.GetSize()){
-                    m_receivers[id] = bth_header.GetSequence();
+                    m_receivers[id] = std::max(m_receivers[id], bth_header.GetSequence());
                     Ptr<Packet> ackPacket = GenerateACK(ipv4_header, hpcc_header, bth_header, true);
                     Send(ackPacket, GetBroadcast(), 0x0800);
+                    // std::cerr << "Generating ACK for flow " << id << " with seq " << m_receivers[id] << std::endl;
                 }
                 else{
                     bth_header.SetSequence(m_receivers[id]);
                     Ptr<Packet> nackPacket = GenerateACK(ipv4_header, hpcc_header, bth_header, false);
                     Send(nackPacket, GetBroadcast(), 0x0800);
+                    // std::cerr << "Generating NACK for flow " << id << " with seq " << m_receivers[id] << std::endl;
                 }
             }
             return;
