@@ -23,6 +23,7 @@
 #include "point-to-point-channel.h"
 #include "pfc-header.h"
 #include "ppp-header.h"
+#include "bubble-header.h"
 #include "packet-tag.h"
 
 #include <unordered_map>
@@ -72,9 +73,9 @@ SwitchNode::AddDevice(Ptr<NetDevice> device)
         m_usedHdrm[ptpDev] = 0;
         m_usedIngress[ptpDev] = 0;
         m_usedEgress[ptpDev] = 0;
-        m_txBytes[ptpDev] = 0;
+        m_bubbleRate[ptpDev] = 0;
         
-        double shared = ptpDev->GetDataRate().GetBitRate() / 1e9 * 4000.0; // 4KB per Gbps
+        double shared = ptpDev->GetDataRate().GetBitRate() / 1e9 * 5000.0; // 5KB per Gbps
         m_bufferTotal += shared;
         m_hdrmTotal += m_hdrmBuffer[ptpDev];
         m_reservedTotal += RESERVED_SIZE;
@@ -147,8 +148,6 @@ SwitchNode::AddHostRouteTo(uint32_t dst, uint32_t devId)
 
 Ptr<Packet>
 SwitchNode::EgressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPointNetDevice> dev){
-    m_txBytes[dev] += packet->GetSize();
-
     if(protocol != 0x0800)
         return packet;
 
@@ -188,26 +187,13 @@ SwitchNode::EgressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPoi
         std::cout << "Egress size : " << m_usedIngress[ingressDev] << std::endl;
     }
 
-    // Add HPCC header
-    if(m_cc == 2){
-        Ipv4Header ipv4_header;
-        UdpHeader udp_header;
-        HpccHeader hpcc_header;
-        packet->RemoveHeader(ipv4_header);
-        packet->RemoveHeader(udp_header);
-        packet->RemoveHeader(hpcc_header);
-        if(hpcc_header.CanAddIntHeader()){
-            hpcc_header.PushIntHeader(dev->GetDataRate(), m_txBytes[dev], dev->GetQueue()->GetNBytes());
-        }
-        packet->AddHeader(hpcc_header);
-        packet->AddHeader(udp_header);
-        packet->AddHeader(ipv4_header);
-    }
-
     packet->AddHeader(ppp);
 
     if(ShouldResume(ingressDev)){
         SendPFC(ingressDev, false);
+    }
+    if(m_pfc == 2){
+        CheckBubble(ingressDev);
     }
     return packet;
 }
@@ -226,7 +212,7 @@ SwitchNode::IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPo
     if((int32_t)packet->GetSize() + m_usedHdrm[dev] > m_hdrmBuffer[dev] && 
        (int32_t)packet->GetSize() + GetUsedShared(dev) > GetSharedThreshold(dev)){
         m_drops += 1;
-        if(m_pfc == 1){
+        if(m_pfc != 0){
             std::cerr << "Drop packet in Switch " << m_nid << " under PFC mode" << std::endl;
         }
         if(m_drops % 10000 == 0){
@@ -289,20 +275,16 @@ SwitchNode::IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPo
     int32_t newBytes = packet->GetSize() + m_usedIngress[dev];
     if(newBytes <= RESERVED_SIZE){
         m_usedIngress[dev] = newBytes;
-        // packetTag.SetReserve(packet->GetSize());
     }
     else {
         int32_t thresh = GetSharedThreshold(dev);
 		if(newBytes - RESERVED_SIZE > thresh){
 			m_usedHdrm[dev] += packet->GetSize();
-            // packetTag.SetHdrm(packet->GetSize());
 		}
         else{
             m_usedIngress[dev] = newBytes;
             int32_t toShared = std::min((int32_t)packet->GetSize(), newBytes - RESERVED_SIZE);
             m_usedShared += toShared;
-            // packetTag.SetReserve(packet->GetSize() - toShared);
-            // packetTag.SetShare(toShared);
 		}
     }
 
@@ -311,6 +293,10 @@ SwitchNode::IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPo
 
     if(ShouldPause(dev)){
         SendPFC(dev, true);
+    }
+
+    if(m_pfc == 2){
+        CheckBubble(dev);
     }
 
     if(ShouldECN(egressDev)){
@@ -366,7 +352,8 @@ SwitchNode::ShouldPause(Ptr<PointToPointNetDevice> dev)
     return false;
 }
 
-bool SwitchNode::ShouldResume(Ptr<PointToPointNetDevice> dev)
+bool 
+SwitchNode::ShouldResume(Ptr<PointToPointNetDevice> dev)
 {
     if(!m_pause[dev])
         return false;
@@ -376,6 +363,50 @@ bool SwitchNode::ShouldResume(Ptr<PointToPointNetDevice> dev)
         return true;
     }
     return false;
+}
+
+void
+SwitchNode::CheckBubble(Ptr<PointToPointNetDevice> dev)
+{
+    uint8_t newRate = 0;
+    int32_t sharedUsed = GetUsedShared(dev);
+    int32_t thresh = GetSharedThreshold(dev);
+    if(m_usedHdrm[dev] > 0 || sharedUsed >= thresh){
+        newRate = 8;
+    }
+    else if(sharedUsed == 0){
+        newRate = 0;
+    }
+    else if(Simulator::Now().GetNanoSeconds() - m_bubbleTime[dev] < 10000){ // 10us
+        return;
+    }
+    else{
+        double total = dev->GetDataRate().GetBitRate() / 1e9 * 5000.0 - m_hdrmBuffer[dev];
+        double target = total * 0.1; // target 10% usage
+
+        double rate = (m_usedIngress[dev] - m_prevBuffer[dev]) * 8.0 / 1e-5 + (m_usedIngress[dev] - target) * 8.0/ 1e-4;
+        double ratio = rate * 8 / dev->GetDataRate().GetBitRate();
+        if(ratio > 7.0)
+            newRate = 7;
+        else if(ratio < 0.0)
+            newRate = 0;
+        else
+            newRate = (uint8_t)ratio;
+    }
+
+    m_prevBuffer[dev] = m_usedIngress[dev];
+    m_bubbleTime[dev] = Simulator::Now().GetNanoSeconds();
+
+    if(newRate != m_bubbleRate[dev]){
+        m_bubbleRate[dev] = newRate;
+        // std::cout << "Switch " << m_nid << " set bubble rate " << (uint32_t)newRate << " for dev" << std::endl;
+        Ptr<Packet> packet = Create<Packet>();
+        BubbleHeader bubbleHeader;
+        bubbleHeader.SetBubbleRate(newRate);
+        packet->AddHeader(bubbleHeader);
+        if(!dev->Send(packet, dev->GetBroadcast(), 0x4321))
+            std::cout << "Drop of Bubble Rate Update" << std::endl;
+    }
 }
 
 void 

@@ -129,6 +129,11 @@ void BuildFatTree(
 		for(uint32_t j = 0;j < numServerperRack;++j){
 			uint32_t serverId = torId * numServerperRack + j;
 			NetDeviceContainer ndc = linkServerSwitch.Install(servers[serverId], tors[torId]);
+			for(int i = 0;i < 2;++i){
+				auto nic = DynamicCast<PointToPointNetDevice>(ndc.Get(i));
+				nic->SetCC(ccVersion);
+				nic->SetPFC(pfcVersion);
+			}
 			auto nic = DynamicCast<PointToPointNetDevice>(ndc.Get(0));
 			nic->SetId(serverId);
 			nic->SetCC(ccVersion);
@@ -143,7 +148,12 @@ void BuildFatTree(
 			for(uint32_t k = 0;k < K;++k){
                 uint32_t torId = blockId * K + j;
                 uint32_t aggId = blockId * K + k;
-				linkSwitchSwitch.Install(tors[torId], aggs[aggId]);
+				NetDeviceContainer ndc = linkSwitchSwitch.Install(tors[torId], aggs[aggId]);
+				for(int i = 0;i < 2;++i){
+					auto nic = DynamicCast<PointToPointNetDevice>(ndc.Get(i));
+					nic->SetCC(ccVersion);
+					nic->SetPFC(pfcVersion);
+				}
 			}
 		}
 	}
@@ -153,7 +163,12 @@ void BuildFatTree(
 			for(uint32_t k = 0;k < K;++k){
                 uint32_t aggId = blockId * K + j;
                 uint32_t coreId = j * K + k;
-				linkSwitchSwitch.Install(aggs[aggId], cores[coreId]);
+				NetDeviceContainer ndc = linkSwitchSwitch.Install(aggs[aggId], cores[coreId]);
+				for(int i = 0;i < 2;++i){
+					auto nic = DynamicCast<PointToPointNetDevice>(ndc.Get(i));
+					nic->SetCC(ccVersion);
+					nic->SetPFC(pfcVersion);
+				}
 			}
 		}
 	}

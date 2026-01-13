@@ -109,6 +109,8 @@ class PppHeader : public Header
      * @brief The PPP protocol type of the payload packet
      */
     uint16_t m_protocol;
+    uint32_t m_padding4;
+    uint64_t m_padding8;
 };
 
 } // namespace ns3

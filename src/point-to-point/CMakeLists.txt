@@ -29,6 +29,7 @@ build_lib(
     model/ppp-header.cc
     model/bth-header.cc
     model/pfc-header.cc
+    model/bubble-header.cc
     model/packet-tag.cc
   HEADER_FILES
     ${mpi_headers}
@@ -42,6 +43,7 @@ build_lib(
     model/ppp-header.h
     model/bth-header.h
     model/pfc-header.h
+    model/bubble-header.h
     model/packet-tag.h
   LIBRARIES_TO_LINK ${libnetwork}
                     ${mpi_libraries}

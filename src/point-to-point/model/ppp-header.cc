@@ -103,19 +103,23 @@ PppHeader::Print(std::ostream& os) const
 uint32_t
 PppHeader::GetSerializedSize() const
 {
-    return 2;
+    return 14;
 }
 
 void
 PppHeader::Serialize(Buffer::Iterator start) const
 {
     start.WriteHtonU16(m_protocol);
+    start.WriteHtonU32(m_padding4);
+    start.WriteHtonU64(m_padding8);
 }
 
 uint32_t
 PppHeader::Deserialize(Buffer::Iterator start)
 {
     m_protocol = start.ReadNtohU16();
+    m_padding4 = start.ReadNtohU32();
+    m_padding8 = start.ReadNtohU64();
     return GetSerializedSize();
 }
 

@@ -216,6 +216,8 @@ class PointToPointNetDevice : public NetDevice
 
 	void SetPFC(uint32_t pfcVersion);
 
+	static const uint8_t m_bubblePriority{1};
+
   protected:
     /**
      * @brief Handler for MPI receive event
@@ -477,13 +479,20 @@ class PointToPointNetDevice : public NetDevice
     static uint16_t EtherToPpp(uint16_t protocol);
 
 	uint32_t m_id; /**< Device ID */
-  uint32_t m_ccVersion{0}; /**< Congestion control version */
-  uint32_t m_pfcVersion{0}; /**< PFC version */
+	uint32_t m_ccVersion{0}; /**< Congestion control version */
+	uint32_t m_pfcVersion{0}; /**< PFC version */
+	uint64_t m_txBytes{0}; /**< Transmitted bytes */
 
     NetDeviceType m_type = NetDeviceType::SWITCH; /**< Device type */
 
     std::unordered_map<uint32_t, Ptr<RdmaQueuePair>> m_flows;
 	std::unordered_map<uint32_t, uint32_t> m_receivers; /**< Map of flow ID to last received sequence number */
+
+	// For bubble
+	EventId m_bubbleEvent; /**< Event ID for bubble event */
+	DataRate m_bubbleRate; /**< Rate for sending bubbles */
+	void SetBubbleRate(DataRate rate);
+	void SendBubble();
 
 	// For transmission
 	EventId m_sendEvent; /**< Event ID for send event */

@@ -74,8 +74,6 @@ protected:
 
     std::unordered_map<uint32_t, std::vector<uint32_t>> m_route;
 
-    std::unordered_map<Ptr<PointToPointNetDevice>, uint64_t> m_txBytes;
-
     // Buffer Management
     uint64_t m_drops = 0;
 
@@ -112,10 +110,15 @@ protected:
     uint32_t m_cc{0};
     uint32_t m_pfc{0};
     std::unordered_map<Ptr<PointToPointNetDevice>, bool> m_pause;
+    std::unordered_map<Ptr<PointToPointNetDevice>, uint8_t> m_bubbleRate;
+    std::unordered_map<Ptr<PointToPointNetDevice>, int64_t> m_bubbleTime;
+    std::unordered_map<Ptr<PointToPointNetDevice>, int64_t> m_prevBuffer;
 
     void SendPFC(Ptr<NetDevice> dev, bool pause);
     bool ShouldPause(Ptr<PointToPointNetDevice> dev);
     bool ShouldResume(Ptr<PointToPointNetDevice> dev);
+
+    void CheckBubble(Ptr<PointToPointNetDevice> dev);
 };
 
 } // namespace ns3

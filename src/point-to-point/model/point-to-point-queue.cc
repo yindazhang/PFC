@@ -110,6 +110,15 @@ PointToPointQueue::GetNBytes() const
     return totalBytes;
 }
 
+uint32_t 
+PointToPointQueue::GetNBytes(uint32_t index) const
+{
+    if(index >= NUM_QUEUE){
+        NS_ABORT_MSG("Invalid index in PointToPointQueue::GetNBytes " << index);
+    }
+    return m_queues[index]->GetNBytes();
+}
+
 void
 PointToPointQueue::SetPauseFlag(uint32_t index, bool flag)
 {

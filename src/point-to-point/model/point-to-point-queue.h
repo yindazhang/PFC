@@ -31,6 +31,7 @@ public:
 
     bool IsEmpty() const;
     uint32_t GetNBytes() const;
+    uint32_t GetNBytes(uint32_t index) const;
 
     void SetPauseFlag(uint32_t index, bool flag);
     bool GetPauseFlag(uint32_t index) const;
