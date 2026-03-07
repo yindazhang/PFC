@@ -15,6 +15,19 @@ FlowInfo currentFlow;
 void ReadLine();
 
 void SetFlow(){
+    // Set RTT for FatTree topology
+    if(currentFlow.src / 64 == currentFlow.dst / 64){
+		if(currentFlow.src / 16 == currentFlow.dst / 16){
+			currentFlow.minRttNs = 4000; // 4 us
+		}
+		else{
+			currentFlow.minRttNs = 8000; // 8 us
+		}
+	}
+	else{
+		currentFlow.minRttNs = 12000; // 12 us
+	}
+    
     Ptr<PointToPointNetDevice> nic = nics[currentFlow.src];
     nic->SetFlow(currentFlow, logFilePtr, ccVersion);
     ReadLine();

@@ -23,7 +23,6 @@
 #include "point-to-point-channel.h"
 #include "pfc-header.h"
 #include "ppp-header.h"
-#include "bubble-header.h"
 #include "packet-tag.h"
 
 #include <unordered_map>
@@ -73,7 +72,6 @@ SwitchNode::AddDevice(Ptr<NetDevice> device)
         m_usedHdrm[ptpDev] = 0;
         m_usedIngress[ptpDev] = 0;
         m_usedEgress[ptpDev] = 0;
-        m_bubbleRate[ptpDev] = 0;
         
         double shared = ptpDev->GetDataRate().GetBitRate() / 1e9 * 5000.0; // 5KB per Gbps
         m_bufferTotal += shared;
@@ -192,9 +190,6 @@ SwitchNode::EgressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPoi
     if(ShouldResume(ingressDev)){
         SendPFC(ingressDev, false);
     }
-    if(m_pfc == 2){
-        CheckBubble(ingressDev);
-    }
     return packet;
 }
 
@@ -295,10 +290,6 @@ SwitchNode::IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPo
         SendPFC(dev, true);
     }
 
-    if(m_pfc == 2){
-        CheckBubble(dev);
-    }
-
     if(ShouldECN(egressDev)){
         m_ecnCount += 1;
         packet->RemoveHeader(ipv4_header);
@@ -363,50 +354,6 @@ SwitchNode::ShouldResume(Ptr<PointToPointNetDevice> dev)
         return true;
     }
     return false;
-}
-
-void
-SwitchNode::CheckBubble(Ptr<PointToPointNetDevice> dev)
-{
-    uint8_t newRate = 0;
-    int32_t sharedUsed = GetUsedShared(dev);
-    int32_t thresh = GetSharedThreshold(dev);
-    if(m_usedHdrm[dev] > 0 || sharedUsed >= thresh){
-        newRate = 8;
-    }
-    else if(sharedUsed == 0){
-        newRate = 0;
-    }
-    else if(Simulator::Now().GetNanoSeconds() - m_bubbleTime[dev] < 10000){ // 10us
-        return;
-    }
-    else{
-        double total = dev->GetDataRate().GetBitRate() / 1e9 * 5000.0 - m_hdrmBuffer[dev];
-        double target = total * 0.1; // target 10% usage
-
-        double rate = (m_usedIngress[dev] - m_prevBuffer[dev]) * 8.0 / 1e-5 + (m_usedIngress[dev] - target) * 8.0/ 1e-4;
-        double ratio = rate * 8 / dev->GetDataRate().GetBitRate();
-        if(ratio > 7.0)
-            newRate = 7;
-        else if(ratio < 0.0)
-            newRate = 0;
-        else
-            newRate = (uint8_t)ratio;
-    }
-
-    m_prevBuffer[dev] = m_usedIngress[dev];
-    m_bubbleTime[dev] = Simulator::Now().GetNanoSeconds();
-
-    if(newRate != m_bubbleRate[dev]){
-        m_bubbleRate[dev] = newRate;
-        // std::cout << "Switch " << m_nid << " set bubble rate " << (uint32_t)newRate << " for dev" << std::endl;
-        Ptr<Packet> packet = Create<Packet>();
-        BubbleHeader bubbleHeader;
-        bubbleHeader.SetBubbleRate(newRate);
-        packet->AddHeader(bubbleHeader);
-        if(!dev->Send(packet, dev->GetBroadcast(), 0x4321))
-            std::cout << "Drop of Bubble Rate Update" << std::endl;
-    }
 }
 
 void 

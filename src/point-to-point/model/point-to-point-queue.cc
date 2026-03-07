@@ -52,11 +52,6 @@ PointToPointQueue::Enqueue(Ptr<Packet> item)
         }
     }
 
-    if(priority == 1 && m_queues[priority]->GetNPackets() >= 2){
-        // Limit the number of bubble packets in high priority queue
-        return false;
-    }
-
     bool ret = m_queues[priority]->Enqueue(item);
     if(!ret){
         std::cout << "Error in buffer " << priority << std::endl;

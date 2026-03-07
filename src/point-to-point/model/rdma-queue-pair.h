@@ -20,9 +20,10 @@ struct FlowInfo
     uint32_t size;
     uint64_t startTime;
     uint64_t endTime;
+	uint64_t minRttNs;
 
-    FlowInfo(uint32_t _id = 0, uint32_t _src = 0, uint32_t _dst = 0, uint32_t _size = 0, uint64_t _startTime = 0, uint64_t _endTime = 0)
-        : id(_id), src(_src), dst(_dst), size(_size), startTime(_startTime), endTime(_endTime)
+    FlowInfo(uint32_t _id = 0, uint32_t _src = 0, uint32_t _dst = 0, uint32_t _size = 0, uint64_t _startTime = 0, uint64_t _endTime = 0, uint64_t _minRttNs = 0)
+        : id(_id), src(_src), dst(_dst), size(_size), startTime(_startTime), endTime(_endTime), minRttNs(_minRttNs)
     {
     }
 };
@@ -54,17 +55,16 @@ public:
 	static const uint8_t m_ackPriority{2};
 
 private:
-	uint64_t m_rttNs{0};
 	uint16_t m_port{0};
 
-	uint32_t m_sendSize{1400};
+	uint32_t m_sendSize{4000};
 	uint32_t m_bytesSent{0};
 	uint32_t m_bytesAcked{0};
 
 	DataRate m_maxRate;
-	DataRate m_minRate{100000000}; // 100 Mbps
+	DataRate m_minRate;
 	DataRate m_currentRate;
-	DataRate m_increase{"0.05Gbps"};
+	DataRate m_increase;
 
 	int64_t m_lastSendTime{0};
 	int64_t m_lastGenerateTime{0};
@@ -81,10 +81,27 @@ private:
 	uint32_t m_pfcVersion{0};
 	int64_t m_prevCnpTime{0};
 
-	// MLX congestion control variables
+	// Congestion control variables
+	double m_alpha{1.0};
+	double m_g{1.0 / 256.0};
+
+	// New DCTCP
+	uint64_t m_win;
+
+	void ProcessNewDctcpACK(uint32_t ackedBytes, bool cnp);
+
+	// DCTCP variables
+	bool m_dctcpCongested{false};
+
+	uint32_t m_dctcpEcnCount{0};
+	uint32_t m_dctcpLastSeq{0};
+	uint32_t m_dctcpLastEcn{0};
+	uint32_t m_dctcpAlphaSize{0};
+
+	void ProcessDctcpACK(uint32_t ackedBytes, bool cnp);
+
+	// MLX variables
 	bool m_mlxCnpAlpha{false};
-	double m_mlxAlpha{1.0};
-	double m_mlxG{1.0 / 256.0};
 
 	int32_t m_mlxTimeStage{0};
 
@@ -98,7 +115,7 @@ private:
 	void UpdateMlxAlpha();
 	void IncreaseMlxRate();
 
-	// HPCC congestion control variables
+	// HPCC variables
 	uint32_t m_hpccLastSeq{0};
 	uint32_t m_hpccIncStage{0};
 	double m_hpccUtil{0.0};

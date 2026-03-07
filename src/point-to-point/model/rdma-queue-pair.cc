@@ -33,26 +33,22 @@ RdmaQueuePair::GetTypeId()
 
 RdmaQueuePair::RdmaQueuePair(FlowInfo flow, Ptr<PointToPointNetDevice> device, FILE* logFilePtr, uint32_t ccVersion, uint32_t pfcVersion)
         : m_flow(flow), m_device(device), m_logFile(logFilePtr), m_ccVersion(ccVersion), m_pfcVersion(pfcVersion){
+	// Add propagation delay to RTT estimation
+	m_flow.minRttNs += m_sendSize * 8 * 1e9 / device->GetDataRate().GetBitRate();
+
 	m_port = (flow.id & 0xFFFF);
+
 	m_maxRate = device->GetDataRate();
+	m_minRate = DataRate(m_sendSize * 8 * 1e9 / m_flow.minRttNs / 2.0); // at least enough to keep one packet in flight
+	m_increase = m_minRate;
+
 	m_currentRate = m_maxRate;
+	m_win = m_currentRate.GetBitRate() / 1e9 * m_flow.minRttNs;
+
 	m_mlxTargetRate = m_currentRate;
 	m_hpccPrevRate = m_currentRate;
 	m_lastSendTime = 0;
 	m_lastGenerateTime = 0;
-
-	// Depends on topology
-	if(flow.src / 64 == flow.dst / 64){
-		if(flow.src / 16 == flow.dst / 16){
-			m_rttNs = 4000; // 4 us
-		}
-		else{
-			m_rttNs = 8000; // 8 us
-		}
-	}
-	else{
-		m_rttNs = 12000; // 12 us
-	}
 };
 
 int64_t 
@@ -110,9 +106,19 @@ RdmaQueuePair::ProcessACK(BthHeader& bth_header, HpccHeader& hpcc_header)
 			}
 			return true;
 		}
+
+		if(newACK){
+			if(m_ccVersion == 3){
+				ProcessDctcpACK(m_bytesAcked, bth_header.GetCNP());
+			}
+			else if(m_ccVersion == 4){
+				ProcessNewDctcpACK(m_bytesAcked, bth_header.GetCNP());
+			}
+		}
 	}
 	else if(bth_header.GetNACK()){
 		m_bytesSent = m_bytesAcked;
+		std::cerr << "NACK received for flow " << m_flow.id << ", retransmitting from byte " << m_bytesSent << std::endl;
 	}
 	else{
 		std::cerr << "Unknown ACK type" << std::endl;
@@ -176,8 +182,18 @@ RdmaQueuePair::GenerateNextPacket()
 	}
 	else{
 		uint32_t inFlight = m_bytesSent - m_bytesAcked;
-		if(inFlight * 8 >= std::max(50000.0, m_currentRate.GetBitRate() * m_rttNs / 1e9)){ 
-			return nullptr;
+		if(m_ccVersion == 4){
+			// std::cout << "Flow " << m_flow.id << " in-flight " << inFlight << " bytes, window " << m_win / 8 << " bytes." << std::endl;
+			if(inFlight * 8 >= std::max(m_sendSize * 8 * 1.5, (double)m_win)){
+				// std::cout << "Flow " << m_flow.id << " in-flight " << inFlight << " bytes, window " << m_win / 8 << " bytes." << std::endl;
+				// std::cout << "Flow " << m_flow.id << " is limited by window, not sending new packet." << std::endl;
+				return nullptr;
+			}
+		}
+		else{
+			if(inFlight * 8 >= std::max(m_sendSize * 8 * 1.5, m_currentRate.GetBitRate() / 1e9 * m_flow.minRttNs)){ 
+				return nullptr;
+			}
 		}
 	}
 
@@ -234,31 +250,102 @@ RdmaQueuePair::WriteFCT(){
 }
 
 void
+RdmaQueuePair::ProcessDctcpACK(uint32_t ackedBytes, bool cnp){
+	m_dctcpEcnCount += cnp;
+
+	if(m_dctcpCongested && ackedBytes > m_dctcpLastEcn){
+		m_dctcpCongested = false;
+	}
+
+	if(ackedBytes > m_dctcpLastSeq){
+		if(m_dctcpLastSeq == 0){
+			m_dctcpAlphaSize = std::max(1U, (m_bytesSent + m_sendSize - 1) / m_sendSize);
+		}
+		else{
+			double frac = std::min(1.0, double(m_dctcpEcnCount) / double(m_dctcpAlphaSize));
+			m_alpha = (1 - m_g) * m_alpha + m_g * frac;
+			m_dctcpEcnCount = 0;
+			m_dctcpAlphaSize = std::max(1U, (m_bytesSent - ackedBytes + m_sendSize - 1) / m_sendSize);
+		}
+
+		if(!m_dctcpCongested && !cnp){
+			m_currentRate = std::min(m_maxRate, m_currentRate + m_increase);
+		}
+		m_dctcpLastSeq = m_bytesSent + 1;
+	}
+
+	if(cnp && !m_dctcpCongested){
+		m_dctcpCongested = true;
+		m_dctcpLastEcn = m_bytesSent + 1;
+		m_currentRate = std::max(m_minRate, m_currentRate * (1.0 - m_alpha / 2.0));
+	}
+}
+
+void
+RdmaQueuePair::ProcessNewDctcpACK(uint32_t ackedBytes, bool cnp){
+	m_dctcpEcnCount += cnp;
+
+	if(m_dctcpCongested && ackedBytes > m_dctcpLastEcn){
+		m_dctcpCongested = false;
+	}
+
+	// std::cout << "Flow " << m_flow.id << " ACKed " << ackedBytes << " bytes, last seq " << m_dctcpLastSeq << std::endl;
+	if(ackedBytes > m_dctcpLastSeq){
+		if(m_dctcpLastSeq == 0){
+			m_dctcpAlphaSize = std::max(1U, (m_bytesSent + m_sendSize - 1) / m_sendSize);
+		}
+		else{
+			double frac = std::min(1.0, double(m_dctcpEcnCount) / double(m_dctcpAlphaSize));
+			m_alpha = (1 - m_g) * m_alpha + m_g * frac;
+			m_dctcpEcnCount = 0;
+			m_dctcpAlphaSize = std::max(1U, (m_bytesSent - ackedBytes + m_sendSize - 1) / m_sendSize);
+		}
+
+		if(!m_dctcpCongested && !cnp){
+			// std::cout << "Flow " << m_flow.id << " ACKed " << ackedBytes << " bytes, increasing rate." << std::endl;
+			m_currentRate = std::min(m_maxRate, m_currentRate + m_increase + m_increase);
+		}
+		m_win = m_win + m_increase.GetBitRate() / 1e9 * m_flow.minRttNs;
+		m_win = std::min((double)m_win, m_maxRate.GetBitRate() / 1e9 * m_flow.minRttNs);
+		m_dctcpLastSeq = m_bytesSent + 1;
+	}
+
+	if(cnp && !m_dctcpCongested){
+		// std::cout << "Flow " << m_flow.id << " received CNP, decreasing rate." << std::endl;
+		m_dctcpCongested = true;
+		m_dctcpLastEcn = m_bytesSent + 1;
+		m_currentRate = std::max(m_minRate, m_currentRate * (1.0 - m_alpha / 2.0));
+		uint64_t window = m_currentRate.GetBitRate() / 1e9 * m_flow.minRttNs;
+		m_win = std::min(m_win, window);
+	}
+}
+
+void
 RdmaQueuePair::DecreaseMlxRate(){
 	m_mlxCnpAlpha = true;
 	// MLX congestion control
 	UpdateMlxAlpha();
-	if(Simulator::Now().GetNanoSeconds() - m_prevCnpTime > 10000){ // 10 microseconds
+	if(Simulator::Now().GetNanoSeconds() - m_prevCnpTime >= m_flow.minRttNs){
 		m_prevCnpTime = Simulator::Now().GetNanoSeconds();
 		m_mlxTargetRate = m_currentRate;
-		m_currentRate = std::max(m_minRate, m_currentRate * (1.0 - m_mlxAlpha / 2.0));
+		m_currentRate = std::max(m_minRate, m_currentRate * (1.0 - m_alpha / 2.0));
 	}
 	m_mlxTimeStage = 0;
 	Simulator::Cancel(m_mlxIncreaseRate);
-	m_mlxIncreaseRate = Simulator::Schedule(MicroSeconds(100), &RdmaQueuePair::IncreaseMlxRate, this);
+	m_mlxIncreaseRate = Simulator::Schedule(NanoSeconds(m_flow.minRttNs * 2), &RdmaQueuePair::IncreaseMlxRate, this);
 }
 
 void
 RdmaQueuePair::UpdateMlxAlpha(){
 	Simulator::Cancel(m_mlxUpdateAlpha);
 	if(m_mlxCnpAlpha){
-		m_mlxAlpha = (1 - m_mlxG) * m_mlxAlpha + m_mlxG;
+		m_alpha = (1 - m_g) * m_alpha + m_g;
 	}
 	else{
-		m_mlxAlpha = (1 - m_mlxG) * m_mlxAlpha;
+		m_alpha = (1 - m_g) * m_alpha;
 	}
 	m_mlxCnpAlpha = false;
-	m_mlxUpdateAlpha = Simulator::Schedule(MicroSeconds(9), &RdmaQueuePair::UpdateMlxAlpha, this);
+	m_mlxUpdateAlpha = Simulator::Schedule(NanoSeconds(m_flow.minRttNs - 1000), &RdmaQueuePair::UpdateMlxAlpha, this);
 }
 
 void
@@ -268,7 +355,7 @@ RdmaQueuePair::IncreaseMlxRate(){
 		m_mlxTargetRate = std::min(m_maxRate, m_mlxTargetRate + m_increase);
 	m_currentRate = (m_mlxTargetRate + m_currentRate) * 0.5;
 	m_mlxTimeStage += 1;
-	m_mlxIncreaseRate = Simulator::Schedule(MicroSeconds(100), &RdmaQueuePair::IncreaseMlxRate, this);
+	m_mlxIncreaseRate = Simulator::Schedule(NanoSeconds(m_flow.minRttNs * 2), &RdmaQueuePair::IncreaseMlxRate, this);
 }
 
 void 
@@ -284,7 +371,7 @@ RdmaQueuePair::UpdateHpccRate(std::vector<IntHeader> newHeaders, bool fullUpdate
 		uint64_t bytes = newHeader.GetBytesDelta(oldHeader);
 		double txRate = bytes * 8.0 / duration; // in bps
 		double util = txRate / newHeader.GetRate().GetBitRate() +
-			std::min(newHeader.GetQueueLen(), oldHeader.GetQueueLen()) / (m_rttNs * 1e-9) / m_maxRate.GetBitRate();
+			std::min(newHeader.GetQueueLen(), oldHeader.GetQueueLen()) / (m_flow.minRttNs * 1e-9) / m_maxRate.GetBitRate();
 		
 		if(util > Util){
 			Util = util;
@@ -296,10 +383,10 @@ RdmaQueuePair::UpdateHpccRate(std::vector<IntHeader> newHeaders, bool fullUpdate
 	DataRate newRate;
 	int32_t newIncStage;
 
-	dt = std::min(dt, m_rttNs);
+	dt = std::min(dt, m_flow.minRttNs);
 
 	// std::cout << m_hpccUtil << " " << Util << " " << std::endl;
-	m_hpccUtil = m_hpccUtil * (1.0 - dt / (double)m_rttNs) + Util * (dt / (double)m_rttNs);
+	m_hpccUtil = m_hpccUtil * (1.0 - dt / (double)m_flow.minRttNs) + Util * (dt / (double)m_flow.minRttNs);
 	double maxC = m_hpccUtil / 0.95;
 
 	if(maxC >= 1 || m_hpccIncStage >= 4){

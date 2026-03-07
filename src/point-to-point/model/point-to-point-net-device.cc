@@ -23,7 +23,6 @@
 #include "ns3/uinteger.h"
 #include "ns3/ipv4-header.h"
 #include "ns3/udp-header.h"
-#include "ns3/bubble-header.h"
 
 #include <unordered_set>
 
@@ -421,15 +420,6 @@ PointToPointNetDevice::Receive(Ptr<Packet> packet)
             }
             return;
         }
-        else if(protocol == 0x1234){
-            return;
-        }
-        else if(protocol == 0x4321){
-            BubbleHeader bubbleHeader;
-            packet->RemoveHeader(bubbleHeader);
-            SetBubbleRate(m_bps * (bubbleHeader.GetBubbleRate() / 8.0));
-            return;
-        }
 
         if(m_type == NetDeviceType::SERVER){
             Ipv4Header ipv4_header;
@@ -472,7 +462,7 @@ PointToPointNetDevice::Receive(Ptr<Packet> packet)
                     bth_header.SetSequence(m_receivers[id]);
                     Ptr<Packet> nackPacket = GenerateACK(ipv4_header, hpcc_header, bth_header, false);
                     Send(nackPacket, GetBroadcast(), 0x0800);
-                    // std::cerr << "Generating NACK for flow " << id << " with seq " << m_receivers[id] << std::endl;
+                    std::cerr << "Generating NACK for flow " << id << " with seq " << m_receivers[id] << std::endl;
                 }
             }
             return;
@@ -849,41 +839,6 @@ PointToPointNetDevice::SetFlow(FlowInfo flow, FILE* logFilePtr, uint32_t ccVersi
 }
 
 void
-PointToPointNetDevice::SetBubbleRate(DataRate rate)
-{
-    if(m_pfcVersion != 2){
-        std::cerr << "PFCv2 must be enabled to use bubble packets!" << std::endl;
-        return;
-    }
-    m_bubbleRate = rate;
-    Simulator::Cancel(m_bubbleEvent);
-    if(m_bubbleRate.GetBitRate() != 0){
-        uint64_t delayNs = 8 * 4000 * 1e9 / m_bubbleRate.GetBitRate(); // 4KB bubbles
-        m_bubbleEvent = Simulator::Schedule(NanoSeconds(delayNs), &PointToPointNetDevice::SendBubble, this);
-    }
-    else if(m_txMachineState == READY){
-        Ptr<Packet> p = m_queue->Dequeue();
-        if (p) TransmitStart(p);
-        else CheckSendQueue();
-    }
-}
-
-void
-PointToPointNetDevice::SendBubble()
-{
-    if(m_queue->GetNBytes(m_bubblePriority) < 5000){
-        PppHeader ppp;
-        Ptr<Packet> bubble = Create<Packet>(4000 - ppp.GetSerializedSize()); // 4KB bubble
-        SocketPriorityTag tag;
-        tag.SetPriority(m_bubblePriority);
-        bubble->ReplacePacketTag(tag);
-        Send(bubble, GetBroadcast(), 0x1234);
-    }
-    uint64_t delayNs = 8 * 4000 * 1e9 / m_bubbleRate.GetBitRate(); // 4KB bubbles
-    m_bubbleEvent = Simulator::Schedule(NanoSeconds(delayNs), &PointToPointNetDevice::SendBubble, this);
-}
-
-void
 PointToPointNetDevice::SetCC(uint32_t ccVersion)
 {
     m_ccVersion = ccVersion;
@@ -966,10 +921,6 @@ PointToPointNetDevice::PppToEther(uint16_t proto)
         return 0x86DD; // IPv6
     case 0x8808:
         return 0x8808; // Ethernet flow control
-    case 0x1234:
-        return 0x1234; // Bubble
-    case 0x4321:
-        return 0x4321; // Bubble Command
     default:
         NS_ASSERT_MSG(false, "PPP Protocol number not defined!");
     }
@@ -988,10 +939,6 @@ PointToPointNetDevice::EtherToPpp(uint16_t proto)
         return 0x0057; // IPv6
     case 0x8808:
         return 0x8808; // Ethernet flow control
-    case 0x1234:
-        return 0x1234; // Bubble
-    case 0x4321:
-        return 0x4321; // Bubble Command
     default:
         NS_ASSERT_MSG(false, "PPP Protocol number not defined!");
     }
