@@ -14,7 +14,9 @@ if __name__ == "__main__":
 
     fct_file = args.file
     dfs = pd.read_csv(fct_file, header=None)
-    dfs = dfs[(dfs[4] > 2040000000) & (dfs[4] < 2160000000)]
+    dfs = dfs[(dfs[4] > 2010000000) & (dfs[4] < 2030000000)]
+    dfs.loc[:, 7] = 8000 + dfs[3] * 8 / 400.0
+    dfs.loc[:, 8] = dfs[6] / dfs[7]
 
     df_vec = [
         dfs,
@@ -25,12 +27,16 @@ if __name__ == "__main__":
     ]
 
     for df in df_vec:
-        tmpdf = df[6].sort_values()
-        size = len(tmpdf)
+        fctdf = df[6].sort_values()
+        slowdf = df[8].sort_values()
+        size = len(fctdf)
 
         print("Flow number: " + str(size))
-        print("FCT mean: " + str(tmpdf.mean()))
-        print("FCT 99%: " + str(tmpdf.iloc[int(0.99 * size)]))
-        print("FCT 99.9%: " + str(tmpdf.iloc[int(0.999 * size)]))
+        print("FCT mean: " + str(fctdf.mean()))
+        print("FCT 99%: " + str(fctdf.iloc[int(0.99 * size)]))
+        print("FCT 99.9%: " + str(fctdf.iloc[int(0.999 * size)]))
+        print("Slowdown mean: " + str(slowdf.mean()))
+        print("Slowdown 99%: " + str(slowdf.iloc[int(0.99 * size)]))
+        print("Slowdown 99.9%: " + str(slowdf.iloc[int(0.999 * size)]))
 
     print("Finish FCT")

@@ -23,27 +23,32 @@ RdmaQueuePair::GetTypeId()
     static TypeId tid = TypeId("ns3::RdmaQueuePair")
                             .SetParent<Object>()
                             .SetGroupName("PointToPoint")
-							.AddAttribute("SendSize",
-								"The amount of data to send each time.",
+							.AddAttribute("MTU",
+								"The MTU size",
 								UintegerValue(4000),
-								MakeUintegerAccessor(&RdmaQueuePair::m_sendSize),
+								MakeUintegerAccessor(&RdmaQueuePair::m_mtu),
 								MakeUintegerChecker<uint32_t>());
     return tid;
 }
 
 RdmaQueuePair::RdmaQueuePair(FlowInfo flow, Ptr<PointToPointNetDevice> device, FILE* logFilePtr, uint32_t ccVersion, uint32_t pfcVersion)
         : m_flow(flow), m_device(device), m_logFile(logFilePtr), m_ccVersion(ccVersion), m_pfcVersion(pfcVersion){
-	// Add propagation delay to RTT estimation
-	m_flow.minRttNs += m_sendSize * 8 * 1e9 / device->GetDataRate().GetBitRate();
 
 	m_port = (flow.id & 0xFFFF);
 
 	m_maxRate = device->GetDataRate();
-	m_minRate = DataRate(m_sendSize * 8 * 1e9 / m_flow.minRttNs / 2.0); // at least enough to keep one packet in flight
+
+	// Add propagation delay to RTT estimation
+	// m_flow.minRttNs += m_mtu * 8 * 1e9 / device->GetDataRate().GetBitRate();
+	m_flow.minRttNs += 1000 * 8 * 1e9 / device->GetDataRate().GetBitRate();
+
+
+	// Constant increase/minrate for different MTU
+	// m_minRate = DataRate(m_mtu * 8 * 1e9 / m_flow.minRttNs / 2.0);
+	m_minRate = DataRate(4000 * 8 * 1e9 / m_flow.minRttNs / 2.0);
 	m_increase = m_minRate;
 
 	m_currentRate = m_maxRate;
-	m_win = m_currentRate.GetBitRate() / 1e9 * m_flow.minRttNs;
 
 	m_mlxTargetRate = m_currentRate;
 	m_hpccPrevRate = m_currentRate;
@@ -54,7 +59,7 @@ RdmaQueuePair::RdmaQueuePair(FlowInfo flow, Ptr<PointToPointNetDevice> device, F
 int64_t 
 RdmaQueuePair::GetNextSendTime()
 {
-	return m_lastGenerateTime + (m_sendSize * 8.0 * 1e9 / m_currentRate.GetBitRate());
+	return m_lastGenerateTime + (m_mtu * 8.0 * 1e9 / m_currentRate.GetBitRate());
 }
 
 bool RdmaQueuePair::IsSendCompleted() const 
@@ -107,14 +112,8 @@ RdmaQueuePair::ProcessACK(BthHeader& bth_header, HpccHeader& hpcc_header)
 			return true;
 		}
 
-		if(newACK){
-			if(m_ccVersion == 3){
-				ProcessDctcpACK(m_bytesAcked, bth_header.GetCNP());
-			}
-			else if(m_ccVersion == 4){
-				ProcessNewDctcpACK(m_bytesAcked, bth_header.GetCNP());
-			}
-		}
+		if(newACK && m_ccVersion == 3)
+			ProcessDctcpACK(m_bytesAcked, bth_header.GetCNP());
 	}
 	else if(bth_header.GetNACK()){
 		m_bytesSent = m_bytesAcked;
@@ -182,24 +181,13 @@ RdmaQueuePair::GenerateNextPacket()
 	}
 	else{
 		uint32_t inFlight = m_bytesSent - m_bytesAcked;
-		if(m_ccVersion == 4){
-			// std::cout << "Flow " << m_flow.id << " in-flight " << inFlight << " bytes, window " << m_win / 8 << " bytes." << std::endl;
-			if(inFlight * 8 >= std::max(m_sendSize * 8 * 1.5, (double)m_win)){
-				// std::cout << "Flow " << m_flow.id << " in-flight " << inFlight << " bytes, window " << m_win / 8 << " bytes." << std::endl;
-				// std::cout << "Flow " << m_flow.id << " is limited by window, not sending new packet." << std::endl;
-				return nullptr;
-			}
-		}
-		else{
-			if(inFlight * 8 >= std::max(m_sendSize * 8 * 1.5, m_currentRate.GetBitRate() / 1e9 * m_flow.minRttNs)){ 
-				return nullptr;
-			}
-		}
+		if(inFlight * 8 >= std::max(m_mtu * 8 * 1.5, m_currentRate.GetBitRate() / 1e9 * m_flow.minRttNs))
+			return nullptr;
 	}
 
 	m_lastSendTime = Simulator::Now().GetNanoSeconds();
 
-	uint32_t toSend = std::min(m_flow.size - m_bytesSent, m_sendSize);
+	uint32_t toSend = std::min(m_flow.size - m_bytesSent, m_mtu);
 	Ptr<Packet> ret = Create<Packet>(toSend);
 
 	BthHeader bth_header;
@@ -259,13 +247,13 @@ RdmaQueuePair::ProcessDctcpACK(uint32_t ackedBytes, bool cnp){
 
 	if(ackedBytes > m_dctcpLastSeq){
 		if(m_dctcpLastSeq == 0){
-			m_dctcpAlphaSize = std::max(1U, (m_bytesSent + m_sendSize - 1) / m_sendSize);
+			m_dctcpAlphaSize = std::max(1U, (m_bytesSent + m_mtu - 1) / m_mtu);
 		}
 		else{
 			double frac = std::min(1.0, double(m_dctcpEcnCount) / double(m_dctcpAlphaSize));
 			m_alpha = (1 - m_g) * m_alpha + m_g * frac;
 			m_dctcpEcnCount = 0;
-			m_dctcpAlphaSize = std::max(1U, (m_bytesSent - ackedBytes + m_sendSize - 1) / m_sendSize);
+			m_dctcpAlphaSize = std::max(1U, (m_bytesSent - ackedBytes + m_mtu - 1) / m_mtu);
 		}
 
 		if(!m_dctcpCongested && !cnp){
@@ -278,45 +266,6 @@ RdmaQueuePair::ProcessDctcpACK(uint32_t ackedBytes, bool cnp){
 		m_dctcpCongested = true;
 		m_dctcpLastEcn = m_bytesSent + 1;
 		m_currentRate = std::max(m_minRate, m_currentRate * (1.0 - m_alpha / 2.0));
-	}
-}
-
-void
-RdmaQueuePair::ProcessNewDctcpACK(uint32_t ackedBytes, bool cnp){
-	m_dctcpEcnCount += cnp;
-
-	if(m_dctcpCongested && ackedBytes > m_dctcpLastEcn){
-		m_dctcpCongested = false;
-	}
-
-	// std::cout << "Flow " << m_flow.id << " ACKed " << ackedBytes << " bytes, last seq " << m_dctcpLastSeq << std::endl;
-	if(ackedBytes > m_dctcpLastSeq){
-		if(m_dctcpLastSeq == 0){
-			m_dctcpAlphaSize = std::max(1U, (m_bytesSent + m_sendSize - 1) / m_sendSize);
-		}
-		else{
-			double frac = std::min(1.0, double(m_dctcpEcnCount) / double(m_dctcpAlphaSize));
-			m_alpha = (1 - m_g) * m_alpha + m_g * frac;
-			m_dctcpEcnCount = 0;
-			m_dctcpAlphaSize = std::max(1U, (m_bytesSent - ackedBytes + m_sendSize - 1) / m_sendSize);
-		}
-
-		if(!m_dctcpCongested && !cnp){
-			// std::cout << "Flow " << m_flow.id << " ACKed " << ackedBytes << " bytes, increasing rate." << std::endl;
-			m_currentRate = std::min(m_maxRate, m_currentRate + m_increase + m_increase);
-		}
-		m_win = m_win + m_increase.GetBitRate() / 1e9 * m_flow.minRttNs;
-		m_win = std::min((double)m_win, m_maxRate.GetBitRate() / 1e9 * m_flow.minRttNs);
-		m_dctcpLastSeq = m_bytesSent + 1;
-	}
-
-	if(cnp && !m_dctcpCongested){
-		// std::cout << "Flow " << m_flow.id << " received CNP, decreasing rate." << std::endl;
-		m_dctcpCongested = true;
-		m_dctcpLastEcn = m_bytesSent + 1;
-		m_currentRate = std::max(m_minRate, m_currentRate * (1.0 - m_alpha / 2.0));
-		uint64_t window = m_currentRate.GetBitRate() / 1e9 * m_flow.minRttNs;
-		m_win = std::min(m_win, window);
 	}
 }
 

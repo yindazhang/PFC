@@ -21,10 +21,16 @@ main(int argc, char* argv[])
 
     cmd.AddValue("cc", "the version of congestion control. 0 : no congestion control", ccVersion);
     cmd.AddValue("pfc", "the version of PFC. 0 : no PFC", pfcVersion);
+    cmd.AddValue("mtu", "the MTU size", mtu);
     cmd.Parse(argc, argv);
 
-    logFile = "logs/" + flowFile + "s_PFC" + std::to_string(pfcVersion) + "_CC" + std::to_string(ccVersion);
-	BuildFatTree(logFile);
+    logFile = "logs/" + flowFile + "s_PFC" + std::to_string(pfcVersion) + "_CC" + std::to_string(ccVersion)
+						+ "_MTU" + std::to_string(mtu);
+	
+	Config::SetDefault("ns3::RdmaQueuePair::MTU", UintegerValue(mtu));
+
+	// BuildFatTree(logFile);
+	BuildLeafSpine(logFile);
 	std::cout << "Build Topology" << std::endl;
 
 	ScheduleFlow();

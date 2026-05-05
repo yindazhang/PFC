@@ -23,7 +23,7 @@ declare -A DURATION=( ["Storage"]=0.2 ["WebSearch"]=0.2 ["Cache"]=0.2 ["Hadoop"]
 for cdf in "${CDFS[@]}"; do
     duration=${DURATION[$cdf]}
     for load in "${LOADS[@]}"; do
-        python3 traffic_gen.py -l "$load" -c "$cdf" -t "$duration" &
+        python3 traffic_gen.py -n 64 -b 400G -l "$load" -c "$cdf" -t "$duration" &
     done
     wait  # Wait for all background jobs of this CDF to finish before continuing
     echo "Finished $cdf"

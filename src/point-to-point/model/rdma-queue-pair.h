@@ -57,7 +57,7 @@ public:
 private:
 	uint16_t m_port{0};
 
-	uint32_t m_sendSize{4000};
+	uint32_t m_mtu{4000};
 	uint32_t m_bytesSent{0};
 	uint32_t m_bytesAcked{0};
 
@@ -84,11 +84,6 @@ private:
 	// Congestion control variables
 	double m_alpha{1.0};
 	double m_g{1.0 / 256.0};
-
-	// New DCTCP
-	uint64_t m_win;
-
-	void ProcessNewDctcpACK(uint32_t ackedBytes, bool cnp);
 
 	// DCTCP variables
 	bool m_dctcpCongested{false};

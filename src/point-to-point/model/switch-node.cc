@@ -68,7 +68,8 @@ SwitchNode::AddDevice(Ptr<NetDevice> device)
     Ptr<PointToPointNetDevice> ptpDev = DynamicCast<PointToPointNetDevice>(device);
     if(ptpDev){
         Ptr<PointToPointChannel> channel = DynamicCast<PointToPointChannel>(ptpDev->GetChannel());
-        m_hdrmBuffer[ptpDev] = ptpDev->GetDataRate().GetBitRate() * channel->GetDelay().GetSeconds() / 8.0 * 3.0; // 3 RTT
+        m_hdrmBuffer[ptpDev] = ptpDev->GetDataRate().GetBitRate() * channel->GetDelay().GetSeconds() / 8.0 * 2.0 + 3 * 9000; // RTT + 3 packets
+        // std::cout << "Hdrm buffer size for Switch " << m_nid << " dev " << index << " : " << m_hdrmBuffer[ptpDev] << std::endl;
         m_usedHdrm[ptpDev] = 0;
         m_usedIngress[ptpDev] = 0;
         m_usedEgress[ptpDev] = 0;
@@ -79,7 +80,7 @@ SwitchNode::AddDevice(Ptr<NetDevice> device)
         m_reservedTotal += RESERVED_SIZE;
         m_sharedTotal += shared - RESERVED_SIZE - m_hdrmBuffer[ptpDev];
         if(shared - RESERVED_SIZE - m_hdrmBuffer[ptpDev] < 0){
-            std::cout << "Warning: Negative shared buffer in Switch " << m_nid << std::endl;
+            std::cerr << "Warning: Negative shared buffer in Switch " << m_nid << std::endl;
         }
 
         m_kmin[ptpDev] = 0.1 * shared;
@@ -160,29 +161,29 @@ SwitchNode::EgressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPoi
 
     m_usedEgress[dev] -= packetTag.GetSize();
     if(m_usedEgress[dev] < 0){
-        std::cout << "Error for usedEgress in Switch " << m_nid << std::endl;
-        std::cout << "Egress size : " << m_usedEgress[dev] << std::endl;
+        std::cerr << "Error for usedEgress in Switch " << m_nid << std::endl;
+        std::cerr << "Egress size : " << m_usedEgress[dev] << std::endl;
     }
 
     int32_t fromHdrm = std::min((int32_t)packetTag.GetSize(), m_usedHdrm[ingressDev]);
     m_usedHdrm[ingressDev] -= fromHdrm;
     if(m_usedHdrm[ingressDev] < 0){
-        std::cout << "Error for usedHdrm in Switch " << m_nid << std::endl;
-        std::cout << "Egress size : " << m_usedHdrm[ingressDev] << std::endl;
+        std::cerr << "Error for usedHdrm in Switch " << m_nid << std::endl;
+        std::cerr << "Egress size : " << m_usedHdrm[ingressDev] << std::endl;
     }
 
     int remain = packetTag.GetSize() - fromHdrm;
 
     m_usedShared -= std::min(remain, std::max(0, m_usedIngress[ingressDev] - RESERVED_SIZE));
     if(m_usedShared < 0){
-        std::cout << "Error for usedShared in Switch " << m_nid << std::endl;
-        std::cout << "Egress size : " << m_usedShared << std::endl;
+        std::cerr << "Error for usedShared in Switch " << m_nid << std::endl;
+        std::cerr << "Egress size : " << m_usedShared << std::endl;
     }
 
     m_usedIngress[ingressDev] -= remain;
     if(m_usedIngress[ingressDev] < 0){
-        std::cout << "Error for usedIngress in Switch " << m_nid << std::endl;
-        std::cout << "Egress size : " << m_usedIngress[ingressDev] << std::endl;
+        std::cerr << "Error for usedIngress in Switch " << m_nid << std::endl;
+        std::cerr << "Egress size : " << m_usedIngress[ingressDev] << std::endl;
     }
 
     packet->AddHeader(ppp);
@@ -209,6 +210,8 @@ SwitchNode::IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPo
         m_drops += 1;
         if(m_pfc != 0){
             std::cerr << "Drop packet in Switch " << m_nid << " under PFC mode" << std::endl;
+            std::cerr << "Used hdrm buffer size : " << m_usedHdrm[dev] << std::endl;
+            std::cerr << "Packet size : " << packet->GetSize() << std::endl;
         }
         if(m_drops % 10000 == 0){
             std::cerr << "Switch " << m_nid << " drop count: " << m_drops << std::endl;
@@ -275,6 +278,9 @@ SwitchNode::IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPo
         int32_t thresh = GetSharedThreshold(dev);
 		if(newBytes - RESERVED_SIZE > thresh){
 			m_usedHdrm[dev] += packet->GetSize();
+            if(!m_pause[dev] && m_usedHdrm[dev] > 9000){
+                std::cerr << "Used hdrm buffer size : " << m_usedHdrm[dev] << " in Switch " << m_nid << std::endl;
+            }
 		}
         else{
             m_usedIngress[dev] = newBytes;
@@ -299,7 +305,7 @@ SwitchNode::IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPo
 
     // Send packet
     if(!egressDev->Send(packet, egressDev->GetBroadcast(), protocol)){
-        std::cout << "Fail to send packet in SwitchNode" << std::endl;
+        std::cerr << "Fail to send packet in SwitchNode" << std::endl;
         return false;
     }
     return true;
@@ -368,7 +374,7 @@ SwitchNode::SendPFC(Ptr<NetDevice> dev, bool pause)
     packet->AddHeader(pfc_header);
 
     if(!dev->Send(packet, dev->GetBroadcast(), 0x8808))
-        std::cout << "Drop of PFC" << std::endl;
+        std::cerr << "Drop of PFC" << std::endl;
 }
 
 } // namespace ns3
