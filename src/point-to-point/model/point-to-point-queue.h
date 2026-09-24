@@ -2,6 +2,7 @@
 #define POINT_TO_POINT_QUEUE_H
 
 #include "ns3/drop-tail-queue.h"
+#include "ns3/ipv6-header.h"
 #include "point-to-point-net-device.h"
 
 #include <vector>
@@ -9,9 +10,26 @@
 namespace ns3
 {
 
+/**
+ * Two-class strict-priority queue. The class is taken from the packet headers:
+ *   - PRIORITY_HIGH: control traffic (ACK/SACK/NACK/CNP/probes, trimmed
+ *     packets), i.e. IPv6 packets with DSCP_HIGH_PRIORITY, and PFC frames;
+ *   - PRIORITY_LOW:  everything else (data, including retransmissions).
+ * Only PRIORITY_LOW can be paused by PFC; PRIORITY_HIGH is always served first.
+ */
 class PointToPointQueue : public Queue<Packet>
 {
 public:
+    enum Priority : uint32_t
+    {
+        PRIORITY_HIGH = 0,
+        PRIORITY_LOW = 1,
+        NUM_PRIORITY = 2,
+    };
+
+    /** IPv6 DSCP that senders (and trimming switches) use for high-priority packets. */
+    static const Ipv6Header::DscpType DSCP_HIGH_PRIORITY = Ipv6Header::DSCP_CS6;
+
     /**
      * \brief Get the type ID.
      * \return the object TypeId
@@ -36,11 +54,14 @@ public:
     void SetPauseFlag(uint32_t index, bool flag);
     bool GetPauseFlag(uint32_t index) const;
 
+    /** Priority of an IPv6 packet from its header. */
+    static Priority GetPriority(const Ipv6Header& header);
+    /** Priority of a packet that starts with a PPP header (as queued by the device). */
+    static Priority GetPriority(Ptr<const Packet> packet);
+
 protected:
     std::vector<Ptr<DropTailQueue<Packet>>> m_queues;
     std::vector<bool> m_pauseFlags;
-
-    static const uint8_t NUM_QUEUE = 4;
 };
 
 } // namespace ns3

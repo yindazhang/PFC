@@ -5,8 +5,6 @@
 #include "ns3/trace-source-accessor.h"
 #include "ns3/uinteger.h"
 
-#include "ns3/socket.h"
-#include "ns3/ipv4-header.h"
 #include "ns3/ppp-header.h"
 
 #include "point-to-point-net-device.h"
@@ -31,7 +29,10 @@ PointToPointQueue::GetTypeId()
 
 PointToPointQueue::PointToPointQueue()
 {
-    for(uint32_t i = 0; i < NUM_QUEUE; ++i){
+    // Low-priority occupancy is bounded by the switch MMU; high priority is
+    // assumed never to overflow its 16 MiB.
+    for (uint32_t i = 0; i < NUM_PRIORITY; ++i)
+    {
         m_queues.push_back(CreateObject<DropTailQueue<Packet>>());
         m_queues[i]->SetMaxSize(QueueSize("16MiB"));
         m_pauseFlags.push_back(false);
@@ -43,19 +44,12 @@ PointToPointQueue::~PointToPointQueue() {}
 bool
 PointToPointQueue::Enqueue(Ptr<Packet> item)
 {
-    int priority = 0;
-    SocketPriorityTag socketPriorityTag;
-    if(item->PeekPacketTag(socketPriorityTag)){
-        priority = socketPriorityTag.GetPriority();
-        if(priority < 0 || priority >= NUM_QUEUE){
-            NS_ABORT_MSG("Invalid priority in PointToPointQueue::Enqueue " << priority);
-        }
-    }
-
+    Priority priority = GetPriority(item);
     bool ret = m_queues[priority]->Enqueue(item);
-    if(!ret){
-        std::cout << "Error in buffer " << priority << std::endl;
-        std::cout << "Buffer size " << m_queues[priority]->GetNBytes() << std::endl;
+    if (!ret)
+    {
+        NS_LOG_WARN("Queue overflow at priority " << priority << " ("
+                  << m_queues[priority]->GetNBytes() << " bytes queued)");
     }
     return ret;
 }
@@ -63,8 +57,10 @@ PointToPointQueue::Enqueue(Ptr<Packet> item)
 Ptr<Packet>
 PointToPointQueue::Dequeue()
 {
-    for(uint32_t i = 0; i < NUM_QUEUE; ++i){
-        if(m_pauseFlags[i])
+    // Strict priority: PRIORITY_HIGH (0) first; skip paused classes
+    for (uint32_t i = 0; i < NUM_PRIORITY; ++i)
+    {
+        if (m_pauseFlags[i])
             continue;
         Ptr<Packet> ret = m_queues[i]->Dequeue();
         if(ret != nullptr)
@@ -76,14 +72,14 @@ PointToPointQueue::Dequeue()
 Ptr<Packet>
 PointToPointQueue::Remove()
 {
-    std::cout << "Remove in PointToPointQueue is not implemented now." << std::endl;
+    NS_LOG_WARN("Remove in PointToPointQueue is not implemented now.");
     return nullptr;
 }
 
 Ptr<const Packet>
 PointToPointQueue::Peek() const
 {
-    std::cout << "Peek in PointToPointQueue is not implemented now." << std::endl;
+    NS_LOG_WARN("Peek in PointToPointQueue is not implemented now.");
     return nullptr;
 }
 
@@ -108,7 +104,7 @@ PointToPointQueue::GetNBytes() const
 uint32_t 
 PointToPointQueue::GetNBytes(uint32_t index) const
 {
-    if(index >= NUM_QUEUE){
+    if(index >= NUM_PRIORITY){
         NS_ABORT_MSG("Invalid index in PointToPointQueue::GetNBytes " << index);
     }
     return m_queues[index]->GetNBytes();
@@ -117,16 +113,44 @@ PointToPointQueue::GetNBytes(uint32_t index) const
 void
 PointToPointQueue::SetPauseFlag(uint32_t index, bool flag)
 {
-    if(index >= NUM_QUEUE){
+    if(index >= NUM_PRIORITY){
         NS_ABORT_MSG("Invalid index in PointToPointQueue::SetPauseFlag " << index);
     }
+    NS_ABORT_MSG_IF(index == PRIORITY_HIGH && flag, "PRIORITY_HIGH must never be paused");
     m_pauseFlags[index] = flag;
+}
+
+PointToPointQueue::Priority
+PointToPointQueue::GetPriority(const Ipv6Header& header)
+{
+    return header.GetDscp() == DSCP_HIGH_PRIORITY ? PRIORITY_HIGH : PRIORITY_LOW;
+}
+
+PointToPointQueue::Priority
+PointToPointQueue::GetPriority(Ptr<const Packet> packet)
+{
+    PppHeader ppp;
+    Ptr<Packet> copy = packet->Copy();
+    copy->RemoveHeader(ppp);
+
+    switch (ppp.GetProtocol())
+    {
+    case 0x0057: { // IPv6
+        Ipv6Header ipv6;
+        copy->PeekHeader(ipv6);
+        return GetPriority(ipv6);
+    }
+    case 0x0021: // IPv4 (not supported by switches; treated as data)
+        return PRIORITY_LOW;
+    default: // PFC and other link-level control frames
+        return PRIORITY_HIGH;
+    }
 }
 
 bool
 PointToPointQueue::GetPauseFlag(uint32_t index) const
 {
-    if(index >= NUM_QUEUE){
+    if(index >= NUM_PRIORITY){
         NS_ABORT_MSG("Invalid index in PointToPointQueue::GetPauseFlag " << index);
     }
     return m_pauseFlags[index];

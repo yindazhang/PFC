@@ -12,26 +12,6 @@
 namespace ns3
 {
 
-#pragma pack(push, 1)
-struct FlowV4Id
-{
-    uint32_t m_srcIP;
-    uint32_t m_dstIP;
-    uint16_t m_srcPort;
-    uint16_t m_dstPort;
-
-    FlowV4Id(uint32_t srcIP = 0, uint32_t dstIP = 0, uint16_t srcPort = 0, uint16_t dstPort = 0)
-        : m_srcIP(srcIP), m_dstIP(dstIP), m_srcPort(srcPort), m_dstPort(dstPort)
-    {};
-    FlowV4Id(const FlowV4Id& flow);
-
-    uint32_t hash(uint32_t seed = 0);
-};
-#pragma pack(pop)
-
-bool operator == (const FlowV4Id& a, const FlowV4Id& b);
-bool operator < (const FlowV4Id& a, const FlowV4Id& b);
-
 /**
  * @ingroup point-to-point
  * @brief Packet header for PPP

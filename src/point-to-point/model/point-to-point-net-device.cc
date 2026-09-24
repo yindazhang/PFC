@@ -21,8 +21,7 @@
 #include "ns3/simulator.h"
 #include "ns3/trace-source-accessor.h"
 #include "ns3/uinteger.h"
-#include "ns3/ipv4-header.h"
-#include "ns3/udp-header.h"
+#include "ns3/ipv6-header.h"
 
 #include <unordered_set>
 
@@ -248,29 +247,10 @@ PointToPointNetDevice::TransmitStart(Ptr<Packet> p)
     NS_LOG_LOGIC("UID is " << p->GetUid() << ")");
 
     if(m_type == NetDeviceType::SWITCH){
-        m_txBytes += p->GetSize();
         PppHeader ppp;
         p->PeekHeader(ppp);
         uint16_t protocol = PppToEther(ppp.GetProtocol());
         p = DynamicCast<SwitchNode>(GetNode())->EgressPipeline(p, protocol, this);
-
-        // Add HPCC header
-        if(p != nullptr && m_ccVersion == 2 && protocol == 0x0800){
-            Ipv4Header ipv4_header;
-            UdpHeader udp_header;
-            HpccHeader hpcc_header;
-            p->RemoveHeader(ppp);
-            p->RemoveHeader(ipv4_header);
-            p->RemoveHeader(udp_header);
-            p->RemoveHeader(hpcc_header);
-            if(hpcc_header.CanAddIntHeader()){
-                hpcc_header.PushIntHeader(GetDataRate(), m_txBytes, GetQueue()->GetNBytes());
-            }
-            p->AddHeader(hpcc_header);
-            p->AddHeader(udp_header);
-            p->AddHeader(ipv4_header);
-            p->AddHeader(ppp);
-        }
     }
 
     //
@@ -411,9 +391,9 @@ PointToPointNetDevice::Receive(Ptr<Packet> packet)
         if(protocol == 0x8808){
             PfcHeader pfc;
             packet->RemoveHeader(pfc);
-            m_queue->SetPauseFlag(pfc.GetQueueIndex(), pfc.GetTime() > 0);
+            m_queue->SetPauseFlag(pfc.GetPriority(), pfc.IsPause());
             
-            if(pfc.GetTime() == 0 && m_txMachineState == READY){
+            if(!pfc.IsPause() && m_txMachineState == READY){
                 Ptr<Packet> p = m_queue->Dequeue();
                 if (p) TransmitStart(p);
                 else CheckSendQueue();
@@ -421,50 +401,15 @@ PointToPointNetDevice::Receive(Ptr<Packet> packet)
             return;
         }
 
-        if(m_type == NetDeviceType::SERVER){
-            Ipv4Header ipv4_header;
-            UdpHeader udp_header;
-            HpccHeader hpcc_header;
-            BthHeader bth_header;
-
-            packet->RemoveHeader(ipv4_header);
-            packet->RemoveHeader(udp_header);
-            if(m_ccVersion == 2){
-                packet->RemoveHeader(hpcc_header);
+        if (m_type == NetDeviceType::SERVER)
+        {
+            if (protocol != 0x86DD)
+            {
+                NS_LOG_WARN("Server device " << m_id << ": drop non-IPv6 packet (protocol 0x"
+                          << std::hex << protocol << std::dec << ")");
+                return;
             }
-            packet->RemoveHeader(bth_header);
-
-            uint32_t id = bth_header.GetId();
-            if(bth_header.GetACK() || bth_header.GetNACK()){
-                if(m_flows.find(id) != m_flows.end()){
-                    if(m_flows[id]->ProcessACK(bth_header, hpcc_header)){
-                        // Flow completed
-                        m_flows.erase(id);
-                        m_sendCompleted.erase(id);
-                    }
-                    else if(m_sendCompleted.find(id) != m_sendCompleted.end()){
-                        auto qp = m_sendCompleted[id];
-                        if(!qp->IsSendCompleted()){
-                            m_sendQueue.emplace(qp->GetNextSendTime(), qp->GetId());
-                            m_sendCompleted.erase(id);
-                        }
-                    }
-                }
-            }
-            else{
-                if(bth_header.GetSequence() <= m_receivers[id] + bth_header.GetSize()){
-                    m_receivers[id] = std::max(m_receivers[id], bth_header.GetSequence());
-                    Ptr<Packet> ackPacket = GenerateACK(ipv4_header, hpcc_header, bth_header, true);
-                    Send(ackPacket, GetBroadcast(), 0x0800);
-                    // std::cerr << "Generating ACK for flow " << id << " with seq " << m_receivers[id] << std::endl;
-                }
-                else{
-                    bth_header.SetSequence(m_receivers[id]);
-                    Ptr<Packet> nackPacket = GenerateACK(ipv4_header, hpcc_header, bth_header, false);
-                    Send(nackPacket, GetBroadcast(), 0x0800);
-                    std::cerr << "Generating NACK for flow " << id << " with seq " << m_receivers[id] << std::endl;
-                }
-            }
+            ReceiveRdma(packet);
             return;
         }
 
@@ -483,47 +428,6 @@ PointToPointNetDevice::Receive(Ptr<Packet> packet)
         m_rxCallback(this, packet, protocol, GetRemote());
     }
 }
-
-Ptr<Packet> 
-PointToPointNetDevice::GenerateACK(Ipv4Header ipv4_header, HpccHeader hpcc_header, BthHeader bth_header, bool isAck)
-{
-	Ptr<Packet> ret = Create<Packet>(0);
-
-	if(isAck)
-		bth_header.SetACK();
-	else
-		bth_header.SetNACK();
-	if(ipv4_header.GetEcn() == Ipv4Header::EcnType::ECN_CE || !isAck)
-		bth_header.SetCNP();
-	bth_header.SetSize(0);
-	ret->AddHeader(bth_header);
-
-    if(m_ccVersion == 2){
-        hpcc_header.StopAddIntHeader();
-        ret->AddHeader(hpcc_header);
-    }
-
-	UdpHeader udp_header;
-	udp_header.SetSourcePort(std::rand() % 65535);
-	udp_header.SetDestinationPort(BthHeader::ROCE_UDP_PORT);
-	ret->AddHeader(udp_header);
-
-	Ipv4Header ipv4_hdr;
-	ipv4_hdr.SetEcn(Ipv4Header::EcnType::ECN_ECT0);
-	ipv4_hdr.SetPayloadSize(20);
-	ipv4_hdr.SetProtocol(17);
-	ipv4_hdr.SetTtl(64);
-	ipv4_hdr.SetSource(ipv4_header.GetDestination());
-	ipv4_hdr.SetDestination(ipv4_header.GetSource());
-	ret->AddHeader(ipv4_hdr);
-
-	SocketPriorityTag tag;
-	tag.SetPriority(RdmaQueuePair::m_ackPriority);
-	ret->ReplacePacketTag(tag);
-
-	return ret;
-}
-
 
 Ptr<PointToPointQueue>
 PointToPointNetDevice::GetQueue() const
@@ -650,37 +554,6 @@ PointToPointNetDevice::IsBridge() const
     return false;
 }
 
-void
-PointToPointNetDevice::CheckRetransmitQueue()
-{
-    while(!m_retransmitQueue.empty()){
-        auto p = m_retransmitQueue.top();
-        
-        if(Simulator::Now().GetNanoSeconds() < p.first)
-            break;
-
-        m_retransmitQueue.pop();
-        if(m_sendCompleted.find(p.second) == m_sendCompleted.end()){
-            continue;
-        }
-
-        auto qp = m_sendCompleted[p.second];
-        if(qp->GetTimeOut() != p.first)
-            continue; // Already retransmitted, to avoid multiple retransmissions for the same timeout
-
-        qp->TimeOutReset();
-        m_sendQueue.emplace(qp->GetNextSendTime(), p.second);
-        m_sendCompleted.erase(p.second);
-    }
-
-    Simulator::Cancel(m_retransmitEvent);
-    if(!m_retransmitQueue.empty()){
-        auto p = m_retransmitQueue.top();
-        m_retransmitEvent = Simulator::Schedule(NanoSeconds(p.first - Simulator::Now().GetNanoSeconds()),
-                &PointToPointNetDevice::CheckRetransmitQueue, this);
-    }
-}
-
 bool
 PointToPointNetDevice::Send(Ptr<Packet> packet, const Address& dest, uint16_t protocolNumber)
 {
@@ -777,77 +650,141 @@ PointToPointNetDevice::SetPromiscReceiveCallback(NetDevice::PromiscReceiveCallba
     m_promiscCallback = cb;
 }
 
-void 
-PointToPointNetDevice::CheckSendQueue(){
-    if(m_sendQueue.empty() || m_type != NetDeviceType::SERVER ||
-            m_txMachineState != READY || m_queue->GetPauseFlag(2))
-        return;
-    
-    if(m_queue->Dequeue() != nullptr){
-        std::cerr << "Queue should be empty when checking send queue!" << std::endl;
-        return;
-    }
-
-    while(!m_sendQueue.empty()){
-        auto p = m_sendQueue.top();
-        if(Simulator::Now().GetNanoSeconds() < p.first)
-            break;
-
-        m_sendQueue.pop();
-        if(m_flows.find(p.second) == m_flows.end())
-            continue;
-        auto qp = m_flows[p.second];
-
-        Ptr<Packet> pkt = qp->GenerateNextPacket();
-
-        if(qp->IsSendCompleted()){
-            m_sendCompleted[p.second] = qp;
-            m_retransmitQueue.emplace(qp->GetTimeOut(), p.second);
-            Simulator::Cancel(m_retransmitEvent);
-            m_retransmitEvent = Simulator::Schedule(NanoSeconds(std::min((int64_t)1, m_retransmitQueue.top().first - Simulator::Now().GetNanoSeconds())), 
-                &PointToPointNetDevice::CheckRetransmitQueue, this);
-        }
-        else{
-            m_sendQueue.emplace(qp->GetNextSendTime(), p.second);
-        }
-
-        if(pkt != nullptr){
-            Send(pkt, GetBroadcast(), 0x0800);
-            return;
-        }
-    }
-
-    Simulator::Cancel(m_sendEvent);
-    if(!m_sendQueue.empty()){
-        auto p = m_sendQueue.top();
-        m_sendEvent = Simulator::Schedule(NanoSeconds(p.first - Simulator::Now().GetNanoSeconds()),
-                &PointToPointNetDevice::CheckSendQueue, this);
-    }
-}
-
 void
-PointToPointNetDevice::SetFlow(FlowInfo flow, FILE* logFilePtr, uint32_t ccVersion)
+PointToPointNetDevice::AddSender(Ptr<RdmaSender> sender)
 {
-    if(m_flows.find(flow.id) != m_flows.end()){
-        std::cerr << "Flow " << flow.id << " already exists!" << std::endl;
-        return;
-    }
-    Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(flow, this, logFilePtr, ccVersion, m_pfcVersion);
-    m_flows[flow.id] = qp;
-    m_sendQueue.emplace(qp->GetNextSendTime(), qp->GetId());
+    uint32_t qpn = sender->GetId();
+    NS_ABORT_MSG_IF(m_senders.find(qpn) != m_senders.end(),
+                    "QP " << qpn << " already has a sender on device " << m_id);
+    SenderEntry& entry = m_senders[qpn];
+    entry.sender = sender;
+    entry.plane = sender->AddPlane(
+        GetDataRate(),
+        MakeCallback(&PointToPointNetDevice::WakeupSender, this).Bind(qpn));
+    ScheduleSender(qpn, Simulator::Now().GetNanoSeconds());
     CheckSendQueue();
 }
 
 void
-PointToPointNetDevice::SetCC(uint32_t ccVersion)
+PointToPointNetDevice::AddReceiver(Ptr<RdmaReceiver> receiver)
 {
-    m_ccVersion = ccVersion;
+    bool added = m_receivers.emplace(receiver->GetQpn(), receiver).second;
+    NS_ABORT_MSG_IF(!added,
+                    "QP " << receiver->GetQpn() << " already has a receiver on device " << m_id);
 }
 
 void
-PointToPointNetDevice::SetPFC(uint32_t pfcVersion)
+PointToPointNetDevice::ScheduleSender(uint32_t qpn, int64_t timeNs)
 {
-    m_pfcVersion = pfcVersion;
+    SenderEntry& entry = m_senders.at(qpn);
+    if (entry.scheduledTime >= 0 && entry.scheduledTime <= timeNs)
+    {
+        return; // already polled at or before timeNs
+    }
+    entry.scheduledTime = timeNs;
+    m_sendQueue.emplace(timeNs, qpn);
+}
+
+void
+PointToPointNetDevice::WakeupSender(uint32_t qpn)
+{
+    if (m_senders.find(qpn) == m_senders.end())
+    {
+        return;
+    }
+    ScheduleSender(qpn, Simulator::Now().GetNanoSeconds());
+    CheckSendQueue();
+}
+
+void
+PointToPointNetDevice::CheckSendQueue()
+{
+    // Pull data only when the link is idle: data would otherwise queue behind
+    // itself, and PFC-paused data must not be generated
+    if (m_type != NetDeviceType::SERVER || m_txMachineState != READY || !m_queue->IsEmpty() ||
+        m_queue->GetPauseFlag(PointToPointQueue::PRIORITY_LOW))
+    {
+        return;
+    }
+
+    int64_t now = Simulator::Now().GetNanoSeconds();
+    while (!m_sendQueue.empty() && m_sendQueue.top().first <= now)
+    {
+        auto [time, qpn] = m_sendQueue.top();
+        m_sendQueue.pop();
+
+        auto it = m_senders.find(qpn);
+        if (it == m_senders.end() || it->second.scheduledTime != time)
+        {
+            continue; // stale entry
+        }
+        SenderEntry& entry = it->second;
+        entry.scheduledTime = -1; // an idle QP stays registered until PostMessage wakes it up
+
+        Ptr<Packet> packet = entry.sender->GenerateNextPacket(entry.plane);
+        int64_t next = entry.sender->GetNextSendTime(entry.plane);
+        if (next >= 0)
+        {
+            ScheduleSender(qpn, std::max(next, now + 1)); // else wait for the wakeup
+        }
+
+        if (packet != nullptr)
+        {
+            Send(packet, GetBroadcast(), 0x86DD);
+            return; // TransmitComplete() calls back when the link is idle again
+        }
+    }
+
+    Simulator::Cancel(m_sendEvent);
+    if (!m_sendQueue.empty())
+    {
+        m_sendEvent = Simulator::Schedule(NanoSeconds(m_sendQueue.top().first - now),
+                                          &PointToPointNetDevice::CheckSendQueue,
+                                          this);
+    }
+}
+
+void
+PointToPointNetDevice::ReceiveRdma(Ptr<Packet> packet)
+{
+    Ipv6Header ipv6Header;
+    BthHeader bthHeader;
+    if (!RdmaReceiver::PeekHeaders(packet, ipv6Header, bthHeader))
+    {
+        NS_LOG_WARN("Server device " << m_id << ": drop non-RoCE packet");
+        return;
+    }
+
+    uint32_t qpn = bthHeader.GetDestQp();
+    uint8_t opcode = bthHeader.GetOpcode();
+    if (opcode == BthHeader::MRC_SACK || opcode == BthHeader::MRC_NACK)
+    {
+        auto it = m_senders.find(qpn);
+        if (it == m_senders.end())
+        {
+            return; // not a QP of this host
+        }
+        it->second.sender->Receive(packet);
+    }
+    else if (bthHeader.IsMrcRequest())
+    {
+        auto it = m_receivers.find(qpn);
+        if (it == m_receivers.end())
+        {
+            NS_LOG_WARN("Server device " << m_id << ": no receiver for QP " << qpn);
+            return;
+        }
+        Ptr<Packet> reply = it->second->Receive(packet);
+        if (reply != nullptr)
+        {
+            Send(reply, GetBroadcast(), 0x86DD);
+        }
+    }
+    else
+    {
+        NS_LOG_WARN("Server device " << m_id << ": unexpected BTH opcode 0x" << std::hex
+                  << +opcode << std::dec);
+    }
 }
 
 bool

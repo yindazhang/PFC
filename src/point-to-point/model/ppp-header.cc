@@ -14,49 +14,6 @@ NS_LOG_COMPONENT_DEFINE("PppHeader");
 
 NS_OBJECT_ENSURE_REGISTERED(PppHeader);
 
-FlowV4Id::FlowV4Id(const FlowV4Id& o)
-{
-    m_srcIP = o.m_srcIP;
-    m_dstIP = o.m_dstIP;
-    m_srcPort = o.m_srcPort;
-    m_dstPort = o.m_dstPort;
-}
-
-bool operator == (const FlowV4Id& a, const FlowV4Id& b){
-    return (a.m_srcIP == b.m_srcIP) && (a.m_dstIP == b.m_dstIP) &&
-        (a.m_srcPort == b.m_srcPort) && (a.m_dstPort == b.m_dstPort);
-}
-
-bool operator < (const FlowV4Id& a, const FlowV4Id& b){
-    return std::tie(a.m_srcIP, a.m_dstIP, a.m_srcPort, a.m_dstPort) <
-          std::tie(b.m_srcIP, b.m_dstIP, b.m_srcPort, b.m_dstPort);
-}
-
-const uint32_t Prime[5] = {2654435761U,246822519U,3266489917U,668265263U,374761393U};
-
-const uint32_t prime[16] = {
-    181, 5197, 1151, 137, 5569, 7699, 2887, 8753, 
-    9323, 8963, 6053, 8893, 9377, 6577, 733, 3527
-};
-
-uint32_t
-rotateLeft(uint32_t x, unsigned char bits)
-{
-    return (x << bits) | (x >> (32 - bits));
-}
-
-uint32_t 
-FlowV4Id::hash(uint32_t seed){
-    uint32_t result = prime[seed];
-
-    result = rotateLeft(result + m_srcPort * Prime[2], 17) * Prime[3];
-    result = rotateLeft(result + m_dstPort * Prime[4], 11) * Prime[0];
-    result = rotateLeft(result + m_srcIP * Prime[3], 17) * Prime[1];
-    result = rotateLeft(result + m_dstIP * Prime[0], 11) * Prime[4];
-
-    return result;
-}
-
 PppHeader::PppHeader()
 {
 }

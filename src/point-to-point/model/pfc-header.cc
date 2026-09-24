@@ -1,8 +1,6 @@
 #include "pfc-header.h"
 
 #include "ns3/abort.h"
-#include "ns3/assert.h"
-#include "ns3/header.h"
 #include "ns3/log.h"
 
 #include <iostream>
@@ -15,10 +13,14 @@ NS_LOG_COMPONENT_DEFINE("PfcHeader");
 NS_OBJECT_ENSURE_REGISTERED(PfcHeader);
 
 PfcHeader::PfcHeader()
+    : PfcHeader(0, false)
 {
-    m_time = 0;
-    m_queueSize = 0;
-    m_queueIndex = 0;
+}
+
+PfcHeader::PfcHeader(uint8_t priority, bool pause)
+    : m_priority(priority),
+      m_pause(pause)
+{
 }
 
 PfcHeader::~PfcHeader()
@@ -44,66 +46,57 @@ PfcHeader::GetInstanceTypeId() const
 void
 PfcHeader::Print(std::ostream& os) const
 {
-    return;
+    os << "PFC " << (m_pause ? "pause" : "resume") << " priority=" << +m_priority;
 }
 
 uint32_t
 PfcHeader::GetSerializedSize() const
 {
-    return 12;
+    return SIZE;
 }
 
 void
 PfcHeader::Serialize(Buffer::Iterator start) const
 {
-    start.WriteHtonU32(m_time);
-    start.WriteHtonU32(m_queueSize);
-    start.WriteHtonU32(m_queueIndex);
+    start.WriteHtonU16(OPCODE_PFC);
+    start.WriteU8(m_priority);
+    start.WriteU8(m_pause ? 1 : 0);
+    start.WriteU8(0, SIZE - 4);
 }
 
 uint32_t
 PfcHeader::Deserialize(Buffer::Iterator start)
 {
-    m_time = start.ReadNtohU32();
-    m_queueSize = start.ReadNtohU32();
-    m_queueIndex = start.ReadNtohU32();
-    return GetSerializedSize();
+    uint16_t opcode = start.ReadNtohU16();
+    NS_ABORT_MSG_IF(opcode != OPCODE_PFC, "Not a PFC frame (opcode 0x" << std::hex << opcode << ")");
+    m_priority = start.ReadU8();
+    m_pause = start.ReadU8() != 0;
+    start.Next(SIZE - 4);
+    return SIZE;
+}
+
+uint8_t
+PfcHeader::GetPriority() const
+{
+    return m_priority;
 }
 
 void
-PfcHeader::SetTime(uint32_t time)
+PfcHeader::SetPriority(uint8_t priority)
 {
-    m_time = time;
+    m_priority = priority;
+}
+
+bool
+PfcHeader::IsPause() const
+{
+    return m_pause;
 }
 
 void
-PfcHeader::SetQueueSize(uint32_t size)
+PfcHeader::SetPause(bool pause)
 {
-    m_queueSize = size;
-}
-
-void
-PfcHeader::SetQueueIndex(uint32_t index)
-{
-    m_queueIndex = index;
-}
-
-uint32_t
-PfcHeader::GetTime() const
-{
-    return m_time;
-}
-
-uint32_t
-PfcHeader::GetQueueSize() const
-{
-    return m_queueSize;
-}
-
-uint32_t
-PfcHeader::GetQueueIndex() const
-{
-    return m_queueIndex;
+    m_pause = pause;
 }
 
 } // namespace ns3

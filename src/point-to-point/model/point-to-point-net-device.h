@@ -20,17 +20,16 @@
 #include "ns3/traced-callback.h"
 
 #include "point-to-point-queue.h"
-#include "rdma-queue-pair.h"
-#include "hpcc-header.h"
+#include "rdma-receiver.h"
+#include "rdma-sender.h"
 
 #include <cstring>
+#include <queue>
 #include <unordered_map>
 
 namespace ns3
 {
 
-struct FlowInfo;
-class RdmaQueuePair;
 class PointToPointQueue;
 class PointToPointChannel;
 class ErrorModel;
@@ -210,11 +209,18 @@ class PointToPointNetDevice : public NetDevice
 
 	void SetDeviceType(NetDeviceType type);
 
-	void SetFlow(FlowInfo flow, FILE* logFilePtr, uint32_t ccVersion);
+    /**
+     * Install a QP's sender on this device (one plane) for the QP's lifetime.
+     * Install the same sender on every plane device of the source host.
+     */
+    void AddSender(Ptr<RdmaSender> sender);
 
-	void SetCC(uint32_t ccVersion);
+    /**
+     * Install a QP's receiver on this device. Install the same receiver on
+     * every plane device of the destination host.
+     */
+    void AddReceiver(Ptr<RdmaReceiver> receiver);
 
-	void SetPFC(uint32_t pfcVersion);
 
   protected:
     /**
@@ -477,36 +483,35 @@ class PointToPointNetDevice : public NetDevice
     static uint16_t EtherToPpp(uint16_t protocol);
 
 	uint32_t m_id; /**< Device ID */
-	uint32_t m_ccVersion{0}; /**< Congestion control version */
-	uint32_t m_pfcVersion{0}; /**< PFC version */
-	uint64_t m_txBytes{0}; /**< Transmitted bytes */
 
     NetDeviceType m_type = NetDeviceType::SWITCH; /**< Device type */
 
-    std::unordered_map<uint32_t, Ptr<RdmaQueuePair>> m_flows;
-	std::unordered_map<uint32_t, uint32_t> m_receivers; /**< Map of flow ID to last received sequence number */
+    // RDMA endpoints (SERVER devices only)
+    struct SenderEntry
+    {
+        Ptr<RdmaSender> sender;
+        uint32_t plane{0};         //!< This device's plane index in the sender
+        int64_t scheduledTime{-1};  //!< Pending m_sendQueue entry (ns), -1 if none
+    };
 
-	// For transmission
-	EventId m_sendEvent; /**< Event ID for send event */
+    std::unordered_map<uint32_t, SenderEntry> m_senders;            //!< QPN -> sender
+    std::unordered_map<uint32_t, Ptr<RdmaReceiver>> m_receivers;    //!< QPN -> receiver
 
-	std::priority_queue<std::pair<int64_t, uint32_t>,
-		std::vector<std::pair<int64_t, uint32_t>>,
-		std::greater<std::pair<int64_t, uint32_t>>> m_sendQueue; /**< Priority queue of (next send time, flow ID) */
-	
-	void CheckSendQueue();
+    EventId m_sendEvent; //!< Next CheckSendQueue() for the earliest scheduled sender
 
-	Ptr<Packet> GenerateACK(Ipv4Header ipv4_header, HpccHeader hpcc_header, BthHeader bth_header, bool isAck = true);
-	
-	// For retransmission
-	std::unordered_map<uint32_t, Ptr<RdmaQueuePair>> m_sendCompleted; /**< Map of flow ID to RdmaQueuePair that has completed sending */
+    std::priority_queue<std::pair<int64_t, uint32_t>,
+                        std::vector<std::pair<int64_t, uint32_t>>,
+                        std::greater<std::pair<int64_t, uint32_t>>>
+        m_sendQueue; //!< (next send time ns, QPN); stale entries are skipped
 
-	EventId m_retransmitEvent; /**< Event ID for retransmit event */
-
-	std::priority_queue<std::pair<int64_t, uint32_t>,
-		std::vector<std::pair<int64_t, uint32_t>>,
-		std::greater<std::pair<int64_t, uint32_t>>> m_retransmitQueue; /**< Priority queue of (next retransmit time, flow ID) */
-	
-	void CheckRetransmitQueue();
+    /** Pull the next data packet from the senders when the device can transmit. */
+    void CheckSendQueue();
+    /** Queue QP \p qpn to be polled at \p timeNs (keeps only the earliest). */
+    void ScheduleSender(uint32_t qpn, int64_t timeNs);
+    /** Wakeup callback given to the senders: poll \p qpn now. */
+    void WakeupSender(uint32_t qpn);
+    /** Deliver an RDMA packet (starting with its IPv6 header) to its sender/receiver. */
+    void ReceiveRdma(Ptr<Packet> packet);
 };
 
 } // namespace ns3

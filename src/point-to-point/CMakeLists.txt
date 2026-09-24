@@ -23,11 +23,12 @@ build_lib(
     model/point-to-point-channel.cc
     model/point-to-point-net-device.cc
     model/point-to-point-queue.cc
-    model/rdma-queue-pair.cc
+    model/rdma-receiver.cc
+    model/rdma-sender.cc
     model/switch-node.cc
-    model/hpcc-header.cc
     model/ppp-header.cc
     model/bth-header.cc
+    model/srv6-header.cc
     model/pfc-header.cc
     model/packet-tag.cc
   HEADER_FILES
@@ -36,11 +37,12 @@ build_lib(
     model/point-to-point-channel.h
     model/point-to-point-net-device.h
     model/point-to-point-queue.h
-    model/rdma-queue-pair.h
+    model/rdma-receiver.h
+    model/rdma-sender.h
     model/switch-node.h
-    model/hpcc-header.h
     model/ppp-header.h
     model/bth-header.h
+    model/srv6-header.h
     model/pfc-header.h
     model/packet-tag.h
   LIBRARIES_TO_LINK ${libnetwork}
