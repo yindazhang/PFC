@@ -10,6 +10,7 @@ sudo apt-get install -y cmake git openssh-client python3-pip python3-pandas pyth
 
 mkdir -p "$HOME/.ssh"
 chmod 700 "$HOME/.ssh"
+sudo chmod -R 777 "$WORK_DIR"
 
 if [[ -z "$(find "$HOME/.ssh" -maxdepth 1 -type f -name '*.pub' -print -quit)" ]]; then
     echo "No SSH public key found; generating an Ed25519 key."
@@ -56,7 +57,9 @@ fi
 
 # Replace src and scratch only when they exist in the repository.
 NS3_DIR="$NS_DIR"
-for directory in src scratch; do
+mkdir -p "$NS3_DIR/commands"
+mkdir -p "$NS3_DIR/commands"
+for directory in src scratch commands; do
     if [ -d "$REPO_NAME/$directory" ] && [ -d "$NS3_DIR" ]; then
         rm -rf "$NS3_DIR/$directory"
         cp -a "$REPO_NAME/$directory" "$NS3_DIR/"
@@ -67,7 +70,6 @@ done
 
 # Build ns3
 cd "$NS3_DIR"
-mkdir -p logs
 rm -rf build/optimized
 ./ns3 configure \
     --build-profile=optimized \

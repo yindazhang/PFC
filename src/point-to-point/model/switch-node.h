@@ -33,18 +33,34 @@ class Srv6RoutingHeader;
  * Among multiple next hops, ECMP hashes only IPv6 header fields (src, dst,
  * flow label, next header), never transport ports.
  *
- * Buffer model (ingress accounting, per ingress port):
+ * Buffer model with PFC (ingress accounting, per ingress port):
  *   - reserved: PORT_RESERVED_BYTES guaranteed to every port;
  *   - shared:   a pool shared by all ports, admitted with a dynamic threshold
  *               (alpha = 1): a port may use at most the free shared space;
  *   - headroom: per-port space for bytes still in flight after a PFC pause.
+ * Without PFC (lossy / trimming) and with egress admission (the default), the
+ * same reserved + dynamic-threshold shared pool is accounted per egress queue
+ * instead, as shared-buffer switches do for lossy traffic: a packet is admitted
+ * if its egress queue stays within its reservation or its shared use stays
+ * within the free shared space; headroom is not used.
  * Total buffer is BUFFER_BYTES_PER_GBPS bytes per Gbps of each port's rate.
  *
  * PFC: a port is paused once it uses headroom or reaches the shared threshold,
  * and resumed when headroom is empty and it is PFC_RESUME_OFFSET below threshold.
  *
  * ECN: RED on egress occupancy with Kmin/Kmax proportional to the port buffer
- * and marking probability up to ECN_PMAX; only ECN-capable packets are marked.
+ * and marking probability up to ECN_PMAX (all settable, SetEcnThresholds).
+ * The 2-bit ECN field carries two independent marks, decided separately:
+ *   - the ECN bit (PointToPointQueue::ECN_MARK_QUEUE), for congestion control:
+ *     the RED decision above; SetEcnMarking, on every port or none;
+ *   - the load-balancing bit (ECN_MARK_LB), for MRC path switching, only
+ *     while the egress queue is above the LB threshold (SetLbThreshold):
+ *     on every packet (LB_STEP, default), or on the packets of a share of the
+ *     connections that grows with the queue (LB_FLOW: hash(src, dst, switch,
+ *     port) / 2^32 < (queue - threshold) / port buffer), or on each packet
+ *     with that same probability (LB_PACKET); SetLbMarking,
+ *     except on ports disabled with SetLbEnabled.
+ * Every low-priority packet is markable.
  * Marking happens at dequeue (default: on the queue left behind, so the
  * signal is not delayed by the queue itself) or at enqueue (SetEcnAtDequeue).
  *
@@ -93,11 +109,47 @@ public:
     void AddSidRoute(uint32_t locator, uint16_t usid, uint32_t ifIndex);
 
     void SetEcmpSeed(uint32_t seed);
-    /** Enable/disable ECN marking on egress device \p ifIndex (MRC disables it on the last hop). */
-    void SetEcnEnabled(uint32_t ifIndex, bool enabled);
+    /**
+     * Enable/disable the load-balancing bit on egress device \p ifIndex. Off on
+     * the last hop (T0 -> server): every path shares it, so it tells nothing
+     * about the path (as MRC). The ECN bit is per switch only (SetEcnMarking).
+     */
+    void SetLbEnabled(uint32_t ifIndex, bool enabled);
+    /** Set the ECN bit (congestion control) on congestion. Default on. */
+    void SetEcnMarking(bool enabled);
+    /**
+     * RED thresholds, as bytes for a 100 Gbps port (scaled with the port rate),
+     * and the marking probability at Kmax. Defaults: 100 KB, 400 KB, 1.0. Call
+     * before devices are added.
+     */
+    void SetEcnThresholds(int32_t kminAt100G, int32_t kmaxAt100G, double pmax);
+    /**
+     * Load-balancing bit threshold, as bytes for a 100 Gbps port (scaled with the
+     * port rate): every packet is marked while the egress queue is above it, none
+     * below (no randomness). Default 100 KB. Call before devices are added.
+     */
+    void SetLbThreshold(int32_t thresholdAt100G);
+
+    /** How the load-balancing bit is decided above the LB threshold. */
+    enum LbMode
+    {
+        LB_STEP, //!< Every packet (default)
+        LB_FLOW, //!< Packets of the connections with hash(src, dst, switch, port) / 2^32 <
+                 //!< (queue - LB threshold) / port buffer: a growing share of connections
+        LB_PACKET, //!< Each packet with probability (queue - LB threshold) / port buffer:
+                   //!< the same share as LB_FLOW, drawn per packet instead of per connection
+    };
+    void SetLbMode(LbMode mode);
+    /**
+     * Set the load-balancing bit (MRC path switching) on congestion. Default on:
+     * it shares the ECN decision and only SRv6 senders read it.
+     */
+    void SetLbMarking(bool enabled);
     /** Mark ECN when a packet leaves the egress queue (default) or when it enters it. */
     void SetEcnAtDequeue(bool atDequeue);
     void SetPfcEnabled(bool enabled);
+    /** Without PFC: dynamic-threshold admission per egress queue (default) or per ingress port. */
+    void SetEgressAdmission(bool enabled);
     /** Trim (instead of drop) low-priority packets that fail admission. Default off. */
     void SetTrimEnabled(bool enabled);
 
@@ -114,7 +166,10 @@ public:
     uint64_t GetTxBytes(uint32_t ifIndex) const;
     uint64_t GetDropCount() const { return m_dropCount; }
     uint64_t GetTrimCount() const { return m_trimCount; }
+    /** Largest low-priority egress queue seen on any port (bytes). */
+    int32_t GetMaxEgressUsed() const { return m_maxEgressUsed; }
     uint64_t GetEcnMarkCount() const { return m_ecnMarkCount; }
+    uint64_t GetLbMarkCount() const { return m_lbMarkCount; }
 
     /** Admission, routing, buffer accounting, PFC/ECN and forwarding. */
     bool IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPointNetDevice> inPort);
@@ -136,9 +191,12 @@ protected:
     static const int32_t HEADROOM_EXTRA_PACKETS = 3;   //!< Packets beyond one RTT in headroom
 
     // ECN (RED) configuration, relative to the port buffer
-    static constexpr double ECN_KMIN_RATIO = 0.1;
-    static constexpr double ECN_KMAX_RATIO = 0.4;
-    static constexpr double ECN_PMAX = 0.2;
+    // Defaults as FASTFLOW / UEC htsim: 20% / 80% of the port buffer, up to probability 1
+    static constexpr double ECN_KMIN_RATIO = 0.2;
+    static constexpr double ECN_KMAX_RATIO = 0.8;
+    static constexpr double ECN_PMAX = 1.0;
+    static constexpr double LB_THRESHOLD_RATIO = 0.2; //!< 100 KB at 100G
+    static const uint32_t LB_HASH_SEED = 0x4C424D4B;  //!< "LBMK": independent of the ECMP hash
 
     /** Per-port MMU, ECN and PFC state (low priority only). */
     struct PortState
@@ -149,17 +207,26 @@ protected:
         int32_t egressUsed{0};   //!< Bytes queued for transmission (as egress)
         int32_t ecnKmin{0};
         int32_t ecnKmax{0};
+        int32_t lbThreshold{0};  //!< Load-balancing bit: mark above this egress queue
+        int32_t portBuffer{0};   //!< Buffer bytes of this port (BUFFER_BYTES_PER_GBPS x rate)
+        uint32_t ifIndex{0};     //!< Device index, salts the LB flow hash
         bool paused{false};      //!< PFC pause sent to the upstream of this port
-        bool ecnEnabled{true};   //!< ECN marking as egress
+        bool lbEnabled{true};    //!< Load-balancing bit marked as egress
         uint64_t txBytes{0};     //!< Low-priority bytes sent (as egress)
     };
 
     /** Shared bytes used by \p port: ingress bytes beyond its reservation. */
     static int32_t GetPortSharedUsed(const PortState& port);
+    /** Shared bytes used by \p port as egress: queued bytes beyond its reservation. */
+    static int32_t GetEgressSharedUsed(const PortState& port);
+    /** Admission and shared-pool accounting per egress queue (PFC off). */
+    bool UseEgressAdmission() const { return !m_pfcEnabled && m_egressAdmission; }
     /** Dynamic shared-buffer threshold (alpha = 1): the free shared space. */
     int32_t GetSharedThreshold() const;
 
     bool ShouldMarkEcn(const PortState& port);
+    /** Set the ECN bit (RED) and the load-balancing bit (step at lbThreshold) of \p header. */
+    void MarkIfCongested(const PortState& port, Ipv6Header& header);
     bool ShouldPause(const PortState& port) const;
     bool ShouldResume(const PortState& port) const;
     /** Send a PFC pause/resume for PRIORITY_LOW upstream of \p port. */
@@ -173,6 +240,11 @@ protected:
      * \return nullptr if the packet is not trimmable (not UDP/RoCE).
      */
     Ptr<Packet> TrimPacket(Ptr<Packet> packet, Ipv6Header& ipv6Header) const;
+
+    /** Whether the LB bit is due for a packet of \p header in egress queue \p port. */
+    bool ShouldMarkLb(const PortState& port, const Ipv6Header& header);
+    /** LB_FLOW hash of a packet's connection (src, dst), salted with this switch and \p port. */
+    uint32_t LbFlowHash(const PortState& port, const Ipv6Header& header) const;
 
     /** ECMP hash over IPv6 header fields only (src, dst, flow label, next header). */
     uint32_t EcmpHash(const Ipv6Header& header) const;
@@ -193,8 +265,16 @@ protected:
     uint16_t m_switchId{0};
     uint32_t m_ecmpSeed{0};
     bool m_pfcEnabled{false};
+    bool m_egressAdmission{true};
     bool m_trimEnabled{false};
     bool m_ecnAtDequeue{true};
+    bool m_ecnMarking{true};  //!< RED sets the ECN bit
+    double m_ecnKminRatio{ECN_KMIN_RATIO}; //!< Kmin as a fraction of the port buffer
+    double m_ecnKmaxRatio{ECN_KMAX_RATIO}; //!< Kmax as a fraction of the port buffer
+    double m_ecnPmax{ECN_PMAX};            //!< Marking probability at Kmax
+    double m_lbThresholdRatio{LB_THRESHOLD_RATIO}; //!< LB threshold as a fraction of the port buffer
+    LbMode m_lbMode{LB_STEP};
+    bool m_lbMarking{true};   //!< RED sets the load-balancing bit
 
     std::unordered_map<Ipv6Address, std::vector<uint32_t>, Ipv6AddressHash>
         m_routes; //!< dst -> next-hop device indices
@@ -208,11 +288,14 @@ protected:
 
     uint64_t m_dropCount{0};
     uint64_t m_trimCount{0};
+    int32_t m_maxEgressUsed{0};
     uint64_t m_ecnMarkCount{0};
+    uint64_t m_lbMarkCount{0};
 
     // Value member on purpose: CreateObject would consume an automatic RNG
     // stream and shift every other random variable in the simulation.
     UniformRandomVariable m_ecnRand;
+    UniformRandomVariable m_lbRand; //!< LB_PACKET draws: own stream, ECN's sequence is unchanged
 };
 
 } // namespace ns3

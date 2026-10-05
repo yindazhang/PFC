@@ -76,7 +76,7 @@ struct MrcCcState
     uint32_t serviceTime{0};       //!< Responder processing time (ns) to subtract from RTT
     uint16_t ecnMarkedPackets{0};  //!< Forward-path CE marks seen since the last SACK
     uint8_t hostBackpressure{0};   //!< Responder host-side congestion level / cwnd penalty
-    uint8_t reserved{0};
+    uint8_t lbMarkedPackets{0};    //!< Forward-path load-balancing marks since the last SACK
 };
 
 /** NETH: NACK Extended Transport Header. */

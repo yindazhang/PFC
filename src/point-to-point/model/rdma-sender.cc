@@ -61,14 +61,15 @@ RdmaSender::GetTypeId()
             .AddAttribute("ReorderWindow",
                           "Time-based loss detection: a packet is lost once a later-sent packet "
                           "was acknowledged and it has been outstanding for the smoothed RTT plus "
-                          "this many base RTTs (doubled on each spurious detection, up to 16)",
-                          DoubleValue(1.0),
+                          "this many base RTTs (doubled on each spurious detection, up to 16). "
+                          "8 absorbs the reordering of spraying over full buffers",
+                          DoubleValue(8.0),
                           MakeDoubleAccessor(&RdmaSender::m_reorderWindow),
                           MakeDoubleChecker<double>(0.0))
             .AddAttribute("MinRto",
                           "Initial retransmission timeout; must exceed the worst queueing "
                           "delay (incl. PFC pauses) to avoid spurious timeouts",
-                          TimeValue(MicroSeconds(200)),
+                          TimeValue(MicroSeconds(400)),
                           MakeTimeAccessor(&RdmaSender::m_minRto),
                           MakeTimeChecker())
             .AddAttribute("MaxRto",
@@ -116,29 +117,38 @@ RdmaSender::GetTypeId()
                           UintegerValue(0),
                           MakeUintegerAccessor(&RdmaSender::m_ecmpEvSetSize),
                           MakeUintegerChecker<uint32_t>())
+            .AddAttribute("EvOnLb",
+                          "SourceRouting: a load-balancing mark on a SACK moves its EV to the "
+                          "backup queue",
+                          BooleanValue(true),
+                          MakeBooleanAccessor(&RdmaSender::m_evOnLb),
+                          MakeBooleanChecker())
+            .AddAttribute("EvOnLoss",
+                          "SourceRouting: a trim NACK, or an RTO on the oldest outstanding "
+                          "packet, moves its EV to the backup queue",
+                          BooleanValue(true),
+                          MakeBooleanAccessor(&RdmaSender::m_evOnLoss),
+                          MakeBooleanChecker())
+            .AddAttribute("EcnIgnoreOnLb",
+                          "Congestion control ignores the ECN of a SACK whose packet also "
+                          "carried the load-balancing mark (path congestion: left to path "
+                          "switching)",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&RdmaSender::m_ecnIgnoreOnLb),
+                          MakeBooleanChecker())
             .AddAttribute("SourceRouting",
                           "MRC static SRv6 source routing with EV management: every EV maps "
-                          "to a path given by AddPath(); ECN skips an EV, loss retires it",
+                          "to a path given by AddPath(); an LB mark, trim or RTO moves an EV to the backup queue",
                           BooleanValue(false),
                           MakeBooleanAccessor(&RdmaSender::m_sourceRouting),
                           MakeBooleanChecker())
             .AddAttribute("EvsPerPlane",
                           "SourceRouting: active EVs (random paths) per plane, the other paths "
-                          "are backups; 0: half of the plane's paths (rounded up)",
+                          "are backups; 0: half of the plane's paths (rounded up); more than the "
+                          "plane has: all of them",
                           UintegerValue(0),
                           MakeUintegerAccessor(&RdmaSender::m_evsPerPlane),
-                          MakeUintegerChecker<uint32_t>(1))
-            .AddAttribute("EvMinActive",
-                          "SourceRouting: an EV is not retired if its plane would keep fewer "
-                          "active EVs than this",
-                          UintegerValue(2),
-                          MakeUintegerAccessor(&RdmaSender::m_evMinActive),
-                          MakeUintegerChecker<uint32_t>(1))
-            .AddAttribute("EcnSkipRtts",
-                          "SourceRouting: base RTTs an EV is skipped after an ECN or trim signal",
-                          DoubleValue(1.0),
-                          MakeDoubleAccessor(&RdmaSender::m_ecnSkipRtts),
-                          MakeDoubleChecker<double>(0.0));
+                          MakeUintegerChecker<uint32_t>(1));
     return tid;
 }
 
@@ -147,8 +157,8 @@ RdmaSender::RdmaSender(QpInfo qp)
       m_mtuShift(12),
       m_rttSerializationBytes(1000),
       m_mpr(1024),
-      m_reorderWindow(1.0),
-      m_minRto(MicroSeconds(200)),
+      m_reorderWindow(8.0),
+      m_minRto(MicroSeconds(400)),
       m_maxRto(MilliSeconds(2)),
       m_packetSpraying(true),
       m_useTimestamp(false),
@@ -157,9 +167,10 @@ RdmaSender::RdmaSender(QpInfo qp)
       m_fairIncrease(0.5),
       m_fastIncrease(2),
       m_sourceRouting(false),
+      m_ecnIgnoreOnLb(false),
+      m_evOnLb(true),
+      m_evOnLoss(true),
       m_evsPerPlane(0),
-      m_evMinActive(2),
-      m_ecnSkipRtts(1.0),
       m_evRng(qp.id),
       m_ecmpEvSetSize(0)
 {
@@ -302,6 +313,7 @@ RdmaSender::BuildEvSet(uint32_t plane)
     m_activeEvs.resize(plane + 1);
     m_backupEvs.resize(plane + 1);
     m_evCursor.resize(plane + 1, 0);
+    m_evTarget.resize(plane + 1, 0);
 
     // Same number of active EVs on every plane (keeps planes equally loaded),
     // sized by the plane with the fewest paths; which paths is random within
@@ -315,6 +327,8 @@ RdmaSender::BuildEvSet(uint32_t plane)
     std::shuffle(evs.begin(), evs.end(), m_evRng);
     uint32_t active = m_evsPerPlane ? std::min<uint32_t>(m_evsPerPlane, fewestPaths)
                                     : (fewestPaths + 1) / 2;
+    // Signals may shrink the active set down to half of the paths, never below
+    m_evTarget[plane] = std::min<uint32_t>(active, (fewestPaths + 1) / 2);
     m_activeEvs[plane].assign(evs.begin(), evs.begin() + active);
     m_backupEvs[plane].assign(evs.begin() + active, evs.end());
 }
@@ -327,86 +341,41 @@ RdmaSender::SelectEv(uint32_t plane)
     {
         return -1;
     }
-    int64_t now = Simulator::Now().GetNanoSeconds();
-    uint32_t n = active.size();
+    // Spray over every active EV in turn
     uint32_t& cursor = m_evCursor[plane];
-    for (uint32_t k = 0; k < n; k++)
-    {
-        uint32_t ev = active[(cursor + k) % n];
-        if (m_evs[ev].skipUntil <= now)
-        {
-            cursor = (cursor + k + 1) % n;
-            return ev;
-        }
-    }
-    // Every active EV is congested: keep rotating rather than stall
-    uint32_t ev = active[cursor % n];
-    cursor = (cursor + 1) % n;
+    uint32_t ev = active[cursor % active.size()];
+    cursor = (cursor + 1) % active.size();
     return ev;
 }
 
 void
-RdmaSender::OnEvCongested(int32_t ev)
+RdmaSender::OnEvSignal(int32_t ev)
 {
     if (ev < 0 || uint32_t(ev) >= m_evs.size())
-    {
-        return;
-    }
-    m_evs[ev].skipUntil = Simulator::Now().GetNanoSeconds() + m_ecnSkipRtts * m_baseRtt;
-    s_stats.evSkips++;
-}
-
-void
-RdmaSender::RestoreEv(uint32_t psn)
-{
-    auto it = m_retiredFor.find(psn);
-    if (it == m_retiredFor.end())
-    {
-        return;
-    }
-    uint32_t ev = it->second;
-    m_retiredFor.erase(it);
-    if (m_evs[ev].state != EV_ASSUMED_BAD)
-    {
-        return;
-    }
-    m_evs[ev].state = EV_GOOD;
-    m_backupEvs[m_evs[ev].plane].push_back(ev);
-    s_stats.evRestores++;
-}
-
-void
-RdmaSender::OnEvLoss(int32_t ev, uint32_t psn)
-{
-    if (ev < 0 || uint32_t(ev) >= m_evs.size() || m_evs[ev].state != EV_GOOD)
     {
         return;
     }
     uint32_t plane = m_evs[ev].plane;
     std::vector<uint32_t>& active = m_activeEvs[plane];
     auto it = std::find(active.begin(), active.end(), uint32_t(ev));
-    if (it == active.end() || (active.size() <= m_evMinActive && m_backupEvs[plane].empty()))
+    if (it == active.end())
     {
-        OnEvCongested(ev); // keep enough paths: only avoid it for a while
-        return;
+        return; // already a backup
     }
+    // To the back of the backup queue
+    std::deque<uint32_t>& backups = m_backupEvs[plane];
+    active.erase(it);
+    backups.push_back(ev);
+    s_stats.evSwaps++;
 
-    // Assume the path failed: replace it by a backup EV of the same plane
-    m_evs[ev].state = EV_ASSUMED_BAD;
-    m_retiredFor[psn] = ev;
-    s_stats.evFailures++;
-    NS_LOG_INFO("QP " << m_qp.id << ": EV " << ev << " (plane " << plane
-                        << ") assumed bad");
-    if (!m_backupEvs[plane].empty())
+    // Below the target (half of the plane's paths): the front of the queue rejoins
+    while (active.size() < m_evTarget[plane] && !backups.empty())
     {
-        *it = m_backupEvs[plane].back();
-        m_backupEvs[plane].pop_back();
+        active.push_back(backups.front());
+        backups.pop_front();
+        s_stats.evRejoins++;
     }
-    else
-    {
-        active.erase(it);
-        m_evCursor[plane] = active.empty() ? 0 : m_evCursor[plane] % active.size();
-    }
+    m_evCursor[plane] = active.empty() ? 0 : m_evCursor[plane] % active.size();
 }
 
 void
@@ -589,7 +558,7 @@ RdmaSender::BuildPacket(const Message& msg, uint32_t psn, bool retransmission, i
     ipv6Header.SetNextHeader(nextHeader);
     ipv6Header.SetHopLimit(64);
     ipv6Header.SetDscp(Ipv6Header::DscpDefault); // data: low priority
-    ipv6Header.SetEcn(Ipv6Header::ECN_ECT0);
+    ipv6Header.SetEcn(Ipv6Header::EcnType(0)); // no marks yet (see PointToPointQueue::ECN_MARK_*)
     ipv6Header.SetFlowLabel(m_entropy);
     ipv6Header.SetPayloadLength(packet->GetSize());
     packet->AddHeader(ipv6Header);
@@ -670,15 +639,15 @@ RdmaSender::ProcessSack(const BthHeader& bth)
     if (seth.flags & MrcSeth::FLAG_DUPLICATE)
     {
         WidenReorderWindow(); // the receiver already had it: a spurious retransmission
-        if (m_sourceRouting)
-        {
-            RestoreEv(psn); // and its first path did deliver it
-        }
     }
-    bool ecn = bth.GetCNP() || cc.ecnMarkedPackets > 0;
-    if (m_sourceRouting && ecn)
+    bool ecn = bth.GetCNP() || cc.ecnMarkedPackets > 0; // congestion control only
+    if (m_ecnIgnoreOnLb && cc.lbMarkedPackets > 0)
     {
-        OnEvCongested(seth.reflectedEv); // this path is more congested than others
+        ecn = false; // the packet also carried the LB mark: path congestion, left to path switching
+    }
+    if (m_sourceRouting && m_evOnLb && cc.lbMarkedPackets > 0)
+    {
+        OnEvSignal(seth.reflectedEv); // load-balancing mark: this path is more congested
     }
 
     uint32_t ackedBytes = 0;
@@ -755,9 +724,9 @@ RdmaSender::ProcessNack(const BthHeader& bth)
     {
         return;
     }
-    if (m_sourceRouting && neth.code == MrcNeth::NACK_TRIMMED)
+    if (m_sourceRouting && m_evOnLoss && neth.code == MrcNeth::NACK_TRIMMED)
     {
-        OnEvCongested(Info(neth.psn).ev);
+        OnEvSignal(Info(neth.psn).ev);
     }
     MarkLost(neth.psn);
 
@@ -816,10 +785,8 @@ RdmaSender::DetectReorderLoss()
         // A packet sent after this one was delivered: lost once it is too old
         if (now - info.sendTime > deadline)
         {
-            if (m_sourceRouting)
-            {
-                OnEvLoss(info.ev, psn); // lost, not trimmed: assume the path failed
-            }
+            // No EV change: with spraying this is mostly reordering, not a failed
+            // path (the LB mark and trims already steer away from congestion)
             s_stats.reorderLosses++;
             MarkLost(psn);
         }
@@ -951,9 +918,9 @@ RdmaSender::RestartRto()
 void
 RdmaSender::OnRto()
 {
-    if (m_sourceRouting && Info(m_cumAck).state == IN_FLIGHT)
+    if (m_sourceRouting && m_evOnLoss && Info(m_cumAck).state == IN_FLIGHT)
     {
-        OnEvLoss(Info(m_cumAck).ev, m_cumAck); // the oldest hole timed out on its path
+        OnEvSignal(Info(m_cumAck).ev); // the oldest hole timed out on its path
     }
     bool anyLost = false;
     for (uint32_t psn = m_cumAck; psn < m_nextPsn; psn++)

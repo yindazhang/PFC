@@ -37,6 +37,11 @@ IPv6, with **multiple planes**, driven by an **AI workload engine**.
 - 256 servers.
 - Per plane, 16 T0 and 16 T1 switches: 16 servers per T0, 1:1 oversubscription.
 - Every link is 1 µs.
+- All of it is set at run time: `--planes`, `--servers`, `--t0`, `--t1`
+  (servers a multiple of t0, t0 ≤ 256 because of the uSID ranges). `--t1` below
+  servers/t0 oversubscribes, above it undersubscribes. The `srv6all_trim` preset
+  uses `EvsPerPlane=65535`, clamped to the paths per plane, so "all" follows `--t1`.
+  Log names include the topology (`_P4_S256_T16x16_`).
 - Addresses: host `fd00::<id>` (`RdmaSender::GetHostAddress`). SRv6 plane locator
   `0xfc00000p`; T0 uSID `0x0100+i`, T1 uSID `0x0200+j`.
 - `--degradeLinks=N`: N random T0–T1 links run at `--degradeRate` (50 Gbps),
@@ -71,15 +76,53 @@ IPv6, with **multiple planes**, driven by an **AI workload engine**.
   - 5 KB per Gbps of port buffer (500 KB per 100G port);
   - 10 KB reserved per port;
   - per-port headroom;
-  - PFC pause/resume on the low class.
-- **ECN:** RED with Kmin 0.1 / Kmax 0.4 of the port buffer and Pmax 0.2, marked
-  at dequeue. It uses `m_ecnRand` (see the bug list), and can be turned off per
-  port (`SetEcnEnabled`).
+  - PFC pause/resume on the low class;
+  - admission: with PFC, per ingress port (reserved, shared, headroom). Without
+    PFC (the default), per egress queue (reserved, shared; no headroom), as
+    shared-buffer switches do for lossy traffic (`--egressAdmission=0` restores
+    ingress; changed 2026-09-30). With α = 1 a single hot queue can still take
+    about half the pool (about 7 MB on a T0), so trims stay rare and queues can
+    outlast the then 200 µs MinRto (1.57 MB peak and 141 RTOs in a 16 MB all-to-all
+    with 256 degraded links). The largest queue is printed (`max queue`).
+- **ECN:** RED with Kmin 0.2 / Kmax 0.8 of the port buffer (100 / 400 KB at
+  100G) and Pmax 1.0, as FASTFLOW / UEC htsim, marked at dequeue. Settable:
+  `--ecnKmin` / `--ecnKmax` (KB for a 100 Gbps port) and `--ecnPmax`. (Until
+  2026-10-01 the defaults were 0.1 / 0.4 and Pmax 0.2, i.e. 50 / 200 KB; in a
+  32 MB spray all-reduce, 50 KB marked 8× more than 100 KB for no gain, 25 KB
+  was 2% slower. Results before that date used the old values.) The 2-bit IPv6 ECN field holds two independent mark bits instead
+  of the RFC 3168 codepoints (`PointToPointQueue::ECN_MARK_*`; senders send 00):
+  - 0x02 = ECN, read only by congestion control (NSCC); `--ecnMark`, default
+    on, **off with `--srcRoute`**, so SRv6 congestion control runs on RTT only;
+  - 0x01 = load-balancing (LB) mark, read only by SRv6 senders for path
+    switching; `--lbMark`, default on (spray senders ignore it).
+  The two bits are decided separately: ECN by RED (below), the LB bit by a
+  step at `--lbThreshold` (KB for a 100 Gbps port, default 100): every
+  packet while the egress queue is above it, none below, no randomness.
+  (Until 2026-10-01 one RED decision set both.) `--lbMode=flow` instead marks
+  only the connections with hash(src, dst, switch, port) / 2^32 <
+  (queue − threshold) / port buffer, so a share of connections that grows
+  with the queue moves away, rather than all of them; the hash has its own
+  seed and is salted per switch and port so the same connections are not
+  always the ones pushed. `--lbMode=packet` uses the same p but draws it per
+  packet (own random stream per switch, so ECN's draws are unchanged), to
+  separate the effect of per-connection vs per-packet marking from the
+  probability curve. `--ecnIgnoreOnLb=1` makes congestion control ignore the
+  ECN of a packet that also carried the LB mark (treated as unmarked, so NSCC
+  may increase), leaving path congestion to path switching.
+  SRv6 path-switching triggers can be turned off one by one: `--evOnLb` (the
+  LB mark) and `--evOnLoss` (trim NACK and RTO), both on by default.
+  Reorder-detected losses never switch paths. The ECN bit is on every port or none (the
+  `--lastHopEcn` option was removed 2026-10-01); the LB bit is set on every
+  fabric port (T0 → T1 and T1 → T0) but never on the last hop (T0 → server),
+  which all paths share.
+  (Changed 2026-10-01. Spray runs are bit-identical to before the split, and
+  so are SRv6 runs at the default, ECN off. SRv6 with `--ecnMark=1` now also
+  marks ECN on the last hop.)
 - **Trimming** (`--trim`): on buffer overflow, the packet becomes a fresh
   header-only packet sent at high priority.
 - **SRv6:** switch identity = (plane locator, switch uSID). A switch forwards
   on the active SID; otherwise it uses its IPv6 route table.
-- These constants are compile-time (`switch-node.h`), not attributes.
+- Buffer sizes are compile-time constants (`switch-node.h`); the ECN thresholds are options (`--ecnKmin` / `--ecnKmax` / `--ecnPmax`).
 
 ### NIC and transport
 
@@ -98,8 +141,11 @@ IPv6, with **multiple planes**, driven by an **AI workload engine**.
     - selective: SACK bitmap plus the triggering PSN;
     - RACK-like loss detection: a packet is lost if a later-sent one was acked
       and it has been out longer than srtt + ReorderWindow × baseRTT, with the
-      window doubling (up to 16) on a duplicate SACK or a late ack;
-    - RTO from 200 µs, backing off up to 2 ms;
+      window doubling (up to 16) on a duplicate SACK or a late ack. The window
+      starts at 8 base RTTs (was 1 until 2026-09-30: about 20k false positives
+      in a 2 MB all-to-all with 256 degraded links; 4 left about 200, 8 left 0);
+    - RTO from 400 µs, backing off up to 2 ms (was 200 µs until 2026-09-30: queues of
+      1.6–3.2 MB on 50G degraded links outlast it, so RTOs fired without any loss);
     - trim NACK → retransmit.
   - **Congestion control: NSCC (UEC / SMaRTT):**
     - four ECN × RTT cases;
@@ -114,11 +160,27 @@ IPv6, with **multiple planes**, driven by an **AI workload engine**.
     - or **SRv6 source routing + EV management** (`--srcRoute=1`):
       - every EV is one SRv6 path;
       - per plane, half the paths are active (the same count on every plane,
-        chosen at random within the plane) and the rest are backups;
-      - ECN or trim on an EV → skip it for EcnSkipRtts base RTTs;
-      - a real loss (reorder or RTO) → mark the EV ASSUMED_BAD and replace it
-        with a backup (keeping at least EvMinActive);
-      - a duplicate SACK → restore an EV that was retired spuriously;
+        chosen at random within the plane) and the rest form the plane's
+        backup queue (FIFO);
+      - every active EV is sprayed in turn (no skipping); the target is half
+        of the plane's paths (rounded up), also for `srv6all_trim`;
+      - an LB mark (not ECN), a trim NACK, or an RTO (on the oldest outstanding packet) for an
+        active EV → it leaves the active set and goes to the back of the
+        backup queue;
+      - whenever a plane is below its target, the queue front rejoins the
+        active set. With half active, it replaces a signalled EV at once; with
+        all active, signalled paths are left out until half remain, then they
+        rotate like the half case;
+      - no skip / ASSUMED_BAD states: without EV probing a bad path would
+        never return, so every EV comes back eventually. Signals for an EV
+        that is already a backup are ignored. (Changed 2026-09-30; replaced
+        `--evSkip`, EcnSkipRtts, ASSUMED_BAD and EvMinActive; a hold time
+        `--evHold` was tried and removed the same day.) Counted as
+        `EV swaps (N rejoined)`;
+      - reorder-detected losses and duplicate SACKs don't touch EVs: under
+        spraying they are reordering, not failed paths (changed 2026-09-30:
+        they used to retire / restore EVs, about 20k spurious retire/restore
+        pairs in a 2 MB all-to-all with 256 degraded links);
       - no EV probing: a retired EV never comes back.
   - Global counters: `RdmaSender::GetGlobalStats()`.
 - **`rdma-receiver`** (responder):
@@ -179,7 +241,10 @@ the same result, and different configurations make the same decisions:
 ## 2. Decisions the user made (don't undo without asking)
 
 - **SRv6 and ECN:**
-  - with SRv6, last-hop ECN (T0 → server) is off (`--srcRoute` forces `lastHopEcn = false`);
+  - the LB bit is never set on the last hop (T0 → server); the ECN bit is on
+    every port or none (`--lastHopEcn` removed 2026-10-01);
+  - with SRv6, switches don't set the ECN bit (`--ecnMark` defaults off), and path
+    switching uses the LB bit; congestion control still reads only the ECN bit;
   - ECN is marked at dequeue;
   - ECN uses `m_ecnRand`.
 - **Failures** are bandwidth degradation (50 Gbps), not links being cut.

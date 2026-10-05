@@ -18,6 +18,7 @@
 #include "srv6-header.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 
@@ -45,6 +46,7 @@ SwitchNode::SwitchNode()
     // m_ecnRand is not built by CreateObject, so its attributes are never
     // applied: set the antithetic flag, left uninitialized otherwise
     m_ecnRand.SetAntithetic(false);
+    m_lbRand.SetAntithetic(false);
 }
 
 SwitchNode::~SwitchNode()
@@ -77,8 +79,11 @@ SwitchNode::AddDevice(Ptr<NetDevice> device)
 
         PortState& port = m_ports[ptpDev];
         port.headroomSize = headroom;
-        port.ecnKmin = ECN_KMIN_RATIO * portBuffer;
-        port.ecnKmax = ECN_KMAX_RATIO * portBuffer;
+        port.ecnKmin = m_ecnKminRatio * portBuffer;
+        port.ecnKmax = m_ecnKmaxRatio * portBuffer;
+        port.lbThreshold = m_lbThresholdRatio * portBuffer;
+        port.portBuffer = portBuffer;
+        port.ifIndex = index;
 
         m_sharedPoolSize += portBuffer - PORT_RESERVED_BYTES - headroom;
         if (portBuffer - PORT_RESERVED_BYTES - headroom < 0)
@@ -127,14 +132,6 @@ SwitchNode::GetTxBytes(uint32_t ifIndex) const
 }
 
 void
-SwitchNode::SetEcnEnabled(uint32_t ifIndex, bool enabled)
-{
-    Ptr<PointToPointNetDevice> dev = DynamicCast<PointToPointNetDevice>(GetDevice(ifIndex));
-    NS_ABORT_MSG_IF(dev == nullptr, "SetEcnEnabled: device " << ifIndex << " is not point-to-point");
-    m_ports.at(dev).ecnEnabled = enabled;
-}
-
-void
 SwitchNode::SetEcnAtDequeue(bool atDequeue)
 {
     m_ecnAtDequeue = atDequeue;
@@ -144,6 +141,56 @@ void
 SwitchNode::SetPfcEnabled(bool enabled)
 {
     m_pfcEnabled = enabled;
+}
+
+void
+SwitchNode::SetLbEnabled(uint32_t ifIndex, bool enabled)
+{
+    Ptr<PointToPointNetDevice> dev = DynamicCast<PointToPointNetDevice>(GetDevice(ifIndex));
+    NS_ABORT_MSG_IF(dev == nullptr, "SetLbEnabled: device " << ifIndex << " is not point-to-point");
+    m_ports.at(dev).lbEnabled = enabled;
+}
+
+void
+SwitchNode::SetEcnMarking(bool enabled)
+{
+    m_ecnMarking = enabled;
+}
+
+void
+SwitchNode::SetEcnThresholds(int32_t kminAt100G, int32_t kmaxAt100G, double pmax)
+{
+    NS_ABORT_MSG_IF(kminAt100G < 0 || kmaxAt100G <= kminAt100G || pmax <= 0 || pmax > 1,
+                    "ECN needs 0 <= Kmin < Kmax and 0 < Pmax <= 1");
+    double portBufferAt100G = 100.0 * BUFFER_BYTES_PER_GBPS;
+    m_ecnKminRatio = kminAt100G / portBufferAt100G;
+    m_ecnKmaxRatio = kmaxAt100G / portBufferAt100G;
+    m_ecnPmax = pmax;
+}
+
+void
+SwitchNode::SetLbThreshold(int32_t thresholdAt100G)
+{
+    NS_ABORT_MSG_IF(thresholdAt100G < 0, "The load-balancing threshold must be >= 0");
+    m_lbThresholdRatio = thresholdAt100G / (100.0 * BUFFER_BYTES_PER_GBPS);
+}
+
+void
+SwitchNode::SetLbMode(LbMode mode)
+{
+    m_lbMode = mode;
+}
+
+void
+SwitchNode::SetLbMarking(bool enabled)
+{
+    m_lbMarking = enabled;
+}
+
+void
+SwitchNode::SetEgressAdmission(bool enabled)
+{
+    m_egressAdmission = enabled;
 }
 
 void
@@ -158,6 +205,7 @@ SwitchNode::SetSwitchId(uint32_t plane, uint16_t switchId)
     m_plane = plane;
     m_switchId = switchId;
     m_ecnRand.SetStream(SidKey(plane, switchId));
+    m_lbRand.SetStream(SidKey(plane, switchId) + (int64_t(1) << 48)); // disjoint from every ECN stream
 }
 
 uint32_t
@@ -192,35 +240,6 @@ SwitchNode::IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPo
     bool lowPriority =
         PointToPointQueue::GetPriority(ipv6Header) == PointToPointQueue::PRIORITY_LOW;
 
-    // Admission (low priority only): must fit in reserved, shared (dynamic threshold) or headroom
-    if (lowPriority)
-    {
-        bool fitsReserved = in.ingressUsed + size <= PORT_RESERVED_BYTES;
-        bool fitsShared = GetPortSharedUsed(in) + size <= GetSharedThreshold();
-        bool fitsHeadroom = in.headroomUsed + size <= in.headroomSize;
-        bool admitted = fitsReserved || fitsShared || fitsHeadroom;
-
-        Ptr<Packet> trimmed = (!admitted && m_trimEnabled) ? TrimPacket(packet, ipv6Header) : nullptr;
-        if (trimmed != nullptr)
-        {
-            // Forward the header-only packet as high priority (no MMU accounting)
-            m_trimCount += 1;
-            packet = trimmed;
-            lowPriority = false;
-        }
-        else if (!admitted)
-        {
-            m_dropCount += 1;
-            if (m_pfcEnabled)
-            {
-                NS_LOG_WARN("Drop under PFC (packet " << size << "B, headroom "
-                                                      << in.headroomUsed << "/" << in.headroomSize
-                                                      << "B)");
-            }
-            return false;
-        }
-    }
-
     // Routing (extension headers and payload are left untouched)
     uint8_t hopLimit = ipv6Header.GetHopLimit();
     if (hopLimit <= 1)
@@ -251,6 +270,48 @@ SwitchNode::IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPo
         return false;
     }
 
+    // Admission (low priority only), with a dynamic threshold (alpha = 1) on the
+    // shared pool. PFC: per ingress port, in reserved, shared or headroom.
+    // Otherwise: per egress queue, in reserved or shared (no headroom).
+    if (lowPriority)
+    {
+        bool admitted;
+        if (UseEgressAdmission())
+        {
+            const PortState& out = m_ports.at(outPort);
+            bool fitsReserved = out.egressUsed + size <= PORT_RESERVED_BYTES;
+            bool fitsShared = GetEgressSharedUsed(out) + size <= GetSharedThreshold();
+            admitted = fitsReserved || fitsShared;
+        }
+        else
+        {
+            bool fitsReserved = in.ingressUsed + size <= PORT_RESERVED_BYTES;
+            bool fitsShared = GetPortSharedUsed(in) + size <= GetSharedThreshold();
+            bool fitsHeadroom = in.headroomUsed + size <= in.headroomSize;
+            admitted = fitsReserved || fitsShared || fitsHeadroom;
+        }
+
+        Ptr<Packet> trimmed = (!admitted && m_trimEnabled) ? TrimPacket(packet, ipv6Header) : nullptr;
+        if (trimmed != nullptr)
+        {
+            // Forward the header-only packet as high priority (no MMU accounting)
+            m_trimCount += 1;
+            packet = trimmed;
+            lowPriority = false;
+        }
+        else if (!admitted)
+        {
+            m_dropCount += 1;
+            if (m_pfcEnabled)
+            {
+                NS_LOG_WARN("Drop under PFC (packet " << size << "B, headroom "
+                                                      << in.headroomUsed << "/" << in.headroomSize
+                                                      << "B)");
+            }
+            return false;
+        }
+    }
+
     if (!lowPriority)
     {
         packet->AddHeader(ipv6Header);
@@ -264,10 +325,17 @@ SwitchNode::IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPo
 
     // Buffer accounting (must precede Send: the egress pipeline may run inside it)
     PortState& out = m_ports.at(outPort);
+    int32_t egressSharedBefore = GetEgressSharedUsed(out);
     out.egressUsed += size;
+    m_maxEgressUsed = std::max(m_maxEgressUsed, out.egressUsed);
 
     int32_t newIngress = in.ingressUsed + size;
-    if (newIngress <= PORT_RESERVED_BYTES)
+    if (UseEgressAdmission())
+    {
+        // The shared pool follows the egress queue; ingress is not accounted
+        m_sharedPoolUsed += GetEgressSharedUsed(out) - egressSharedBefore;
+    }
+    else if (newIngress <= PORT_RESERVED_BYTES)
     {
         in.ingressUsed = newIngress;
     }
@@ -296,10 +364,9 @@ SwitchNode::IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPo
     }
 
     // ECN marking at enqueue, on egress occupancy including this packet
-    if (!m_ecnAtDequeue && ipv6Header.GetEcn() != Ipv6Header::ECN_NotECT && ShouldMarkEcn(out))
+    if (!m_ecnAtDequeue)
     {
-        m_ecnMarkCount += 1;
-        ipv6Header.SetEcn(Ipv6Header::ECN_CE);
+        MarkIfCongested(out, ipv6Header);
     }
 
     packet->AddHeader(ipv6Header);
@@ -335,16 +402,24 @@ SwitchNode::EgressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPoi
     PortState& out = m_ports.at(outPort);
     int32_t size = packetTag.GetSize();
 
+    int32_t egressSharedBefore = GetEgressSharedUsed(out);
     out.egressUsed -= size;
     out.txBytes += size;
 
-    // Release headroom first, then shared, then reserved
-    int32_t fromHeadroom = std::min(size, in.headroomUsed);
-    in.headroomUsed -= fromHeadroom;
+    if (UseEgressAdmission())
+    {
+        m_sharedPoolUsed -= egressSharedBefore - GetEgressSharedUsed(out);
+    }
+    else
+    {
+        // Release headroom first, then shared, then reserved
+        int32_t fromHeadroom = std::min(size, in.headroomUsed);
+        in.headroomUsed -= fromHeadroom;
 
-    int32_t remain = size - fromHeadroom;
-    m_sharedPoolUsed -= std::min(remain, GetPortSharedUsed(in));
-    in.ingressUsed -= remain;
+        int32_t remain = size - fromHeadroom;
+        m_sharedPoolUsed -= std::min(remain, GetPortSharedUsed(in));
+        in.ingressUsed -= remain;
+    }
 
     NS_ASSERT_MSG(out.egressUsed >= 0 && in.headroomUsed >= 0 && m_sharedPoolUsed >= 0 &&
                       in.ingressUsed >= 0,
@@ -354,17 +429,13 @@ SwitchNode::EgressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPoi
                                                      << in.ingressUsed << ")");
 
     // ECN marking at dequeue, on the egress queue this packet leaves behind
-    if (m_ecnAtDequeue && ShouldMarkEcn(out))
+    if (m_ecnAtDequeue && (m_ecnMarking || m_lbMarking))
     {
         PppHeader ppp;
         Ipv6Header ipv6Header;
         packet->RemoveHeader(ppp);
         packet->RemoveHeader(ipv6Header);
-        if (ipv6Header.GetEcn() != Ipv6Header::ECN_NotECT)
-        {
-            m_ecnMarkCount += 1;
-            ipv6Header.SetEcn(Ipv6Header::ECN_CE);
-        }
+        MarkIfCongested(out, ipv6Header);
         packet->AddHeader(ipv6Header);
         packet->AddHeader(ppp);
     }
@@ -383,15 +454,88 @@ SwitchNode::GetPortSharedUsed(const PortState& port)
 }
 
 int32_t
+SwitchNode::GetEgressSharedUsed(const PortState& port)
+{
+    return std::max(0, port.egressUsed - PORT_RESERVED_BYTES);
+}
+
+int32_t
 SwitchNode::GetSharedThreshold() const
 {
     return m_sharedPoolSize - m_sharedPoolUsed;
 }
 
+void
+SwitchNode::MarkIfCongested(const PortState& port, Ipv6Header& header)
+{
+    // ECN: RED, for congestion control
+    if (m_ecnMarking && ShouldMarkEcn(port))
+    {
+        m_ecnMarkCount += 1;
+        PointToPointQueue::SetEcnMark(header, PointToPointQueue::ECN_MARK_QUEUE);
+    }
+    // Load balancing: a step at the threshold, for path switching
+    if (m_lbMarking && port.lbEnabled && ShouldMarkLb(port, header))
+    {
+        m_lbMarkCount += 1;
+        PointToPointQueue::SetEcnMark(header, PointToPointQueue::ECN_MARK_LB);
+    }
+}
+
+uint32_t
+SwitchNode::LbFlowHash(const PortState& port, const Ipv6Header& header) const
+{
+    // Connection (src, dst), salted per switch and egress port, with its own seed
+    uint8_t buf[4 + 16 + 16 + 4 + 2 + 4];
+    uint8_t* p = buf;
+    uint32_t seed = LB_HASH_SEED;
+    std::memcpy(p, &seed, 4);
+    p += 4;
+    header.GetSource().GetBytes(p);
+    p += 16;
+    header.GetDestination().GetBytes(p);
+    p += 16;
+    std::memcpy(p, &m_plane, 4);
+    p += 4;
+    std::memcpy(p, &m_switchId, 2);
+    p += 2;
+    std::memcpy(p, &port.ifIndex, 4);
+    return Hash32(reinterpret_cast<const char*>(buf), sizeof(buf));
+}
+
+bool
+SwitchNode::ShouldMarkLb(const PortState& port, const Ipv6Header& header)
+{
+    if (port.egressUsed <= port.lbThreshold)
+    {
+        return false;
+    }
+    // Share of the traffic to move off this queue (flow / packet modes)
+    double share = double(port.egressUsed - port.lbThreshold) / port.portBuffer;
+
+    switch (m_lbMode)
+    {
+    case LB_STEP:
+        // Every packet above the threshold
+        return true;
+
+    case LB_FLOW:
+        // The connections whose hash, mapped to [0, 1), falls below the share
+        return share >= 1.0 ||
+               LbFlowHash(port, header) / (double(UINT32_MAX) + 1.0) < share;
+
+    case LB_PACKET:
+        // Each packet with probability share
+        return share >= 1.0 || m_lbRand.GetValue(0.0, 1.0) < share;
+    }
+    NS_ABORT_MSG("Unknown load-balancing mode " << m_lbMode);
+    return false;
+}
+
 bool
 SwitchNode::ShouldMarkEcn(const PortState& port)
 {
-    if (!port.ecnEnabled || port.egressUsed < port.ecnKmin)
+    if (port.egressUsed < port.ecnKmin)
     {
         return false;
     }
@@ -400,7 +544,7 @@ SwitchNode::ShouldMarkEcn(const PortState& port)
         return true;
     }
     double prob =
-        ECN_PMAX * (port.egressUsed - port.ecnKmin) / (port.ecnKmax - port.ecnKmin);
+        m_ecnPmax * (port.egressUsed - port.ecnKmin) / (port.ecnKmax - port.ecnKmin);
     return m_ecnRand.GetValue(0.0, 1.0) < prob;
 }
 

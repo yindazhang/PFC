@@ -10,6 +10,7 @@ Usage:
   commands/fct.py RESULTS --by-size      also split each run by message size
   commands/fct.py RESULTS --cdf out.csv  write the FCT CDF of every run
   commands/fct.py RESULTS --ack          use post -> ack (sender completion) instead
+  commands/fct.py RESULTS --iter 1       only messages posted in the second iteration (0-based)
 
 Columns: messages, mean / p50 / p90 / p99 / max FCT (us), and slowdown = FCT
 divided by the time the message takes alone at --rate (serialization only,
@@ -17,11 +18,12 @@ without the base RTT).
 """
 import argparse
 import os
+import sys
 
 import numpy as np
 import pandas as pd
 
-from common import find_files, print_table, run_label
+from common import find_files, iteration_windows, print_table, run_label
 
 COLUMNS = ["id", "qp", "src", "dst", "size", "post", "receive", "ack", "fct"]
 
@@ -56,7 +58,11 @@ def main():
     ap.add_argument("--by-size", action="store_true", help="split every run by message size")
     ap.add_argument("--cdf", metavar="CSV", help="write run,fct_us,cdf for every run")
     ap.add_argument("--csv", metavar="CSV", help="also write the table as CSV")
+    ap.add_argument("--iter", metavar="N[,N...]",
+                    help="only messages posted in these iterations (0-based, e.g. 1 = the second; "
+                         "boundaries from the run's .jct log)")
     args = ap.parse_args()
+    select = sorted({int(x) for x in args.iter.split(",")}) if args.iter else None
 
     files = find_files(args.paths, "*.fct")
     header = ["run", "messages", "mean_us", "p50_us", "p90_us", "p99_us", "max_us", "slowdown", "p99_slowdown"]
@@ -67,6 +73,16 @@ def main():
     for path in files:
         label = run_label(path, files)
         df = load(path, args.ack)
+        if select is not None:
+            windows = iteration_windows(path)
+            if windows is None:
+                sys.exit(f"--iter needs the .jct log next to {path}")
+            keep = np.zeros(len(df), dtype=bool)
+            for it in select:
+                if it in windows:
+                    lo, hi = windows[it]
+                    keep |= (df["post"] >= lo) & (df["post"] < hi)
+            df = df[keep]
         if df.empty:
             rows.append([label] + (["-"] if args.by_size else []) + [0] + [float("nan")] * 7)
             continue

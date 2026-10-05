@@ -110,7 +110,7 @@ RdmaReceiver::Receive(Ptr<Packet> packet)
     }
 
     uint32_t psn = BthHeader::UnwrapPsn(bthHeader.GetPsn(), m_expectedPsn);
-    bool ce = ipv6Header.GetEcn() == Ipv6Header::ECN_CE;
+    bool ce = PointToPointQueue::HasEcnMark(ipv6Header, PointToPointQueue::ECN_MARK_QUEUE);
 
     if (IsReceived(psn))
     {
@@ -180,6 +180,8 @@ RdmaReceiver::BuildSack(const Ipv6Header& dataIp,
     cc.rcvdBytes = m_rcvdBytes;
     cc.echoTimestamp = dataBth.GetTSH() ? dataBth.GetTseth().timestamp : 0;
     cc.ecnMarkedPackets = ce ? 1 : 0;
+    cc.lbMarkedPackets =
+        PointToPointQueue::HasEcnMark(dataIp, PointToPointQueue::ECN_MARK_LB) ? 1 : 0;
 
     BthHeader bth;
     bth.SetOpcode(BthHeader::MRC_SACK);
@@ -227,7 +229,7 @@ RdmaReceiver::Encapsulate(BthHeader& replyBth, const Ipv6Header& dataIp) const
     ipv6Header.SetNextHeader(Srv6RoutingHeader::IPV6_NEXT_HEADER_UDP);
     ipv6Header.SetHopLimit(64);
     ipv6Header.SetDscp(PointToPointQueue::DSCP_HIGH_PRIORITY);
-    ipv6Header.SetEcn(Ipv6Header::ECN_ECT0);
+    ipv6Header.SetEcn(Ipv6Header::EcnType(0)); // high priority: never marked
     ipv6Header.SetFlowLabel(dataIp.GetFlowLabel());
     ipv6Header.SetPayloadLength(reply->GetSize());
     reply->AddHeader(ipv6Header);

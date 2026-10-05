@@ -31,6 +31,27 @@ public:
     static const Ipv6Header::DscpType DSCP_HIGH_PRIORITY = Ipv6Header::DSCP_CS6;
 
     /**
+     * The 2-bit IPv6 ECN field is used as two independent mark bits instead of
+     * the RFC 3168 codepoints: senders send 00, switches only set bits, and
+     * every low-priority (data) packet is ECN-capable, so no codepoint is spent
+     * on Not-ECT. High-priority packets are never marked.
+     */
+    static const uint8_t ECN_MARK_QUEUE = 0x02; //!< ECN: congestion-control signal
+    static const uint8_t ECN_MARK_LB = 0x01;    //!< Load-balancing signal: MRC path switching
+
+    /** Whether \p header carries ECN mark bit \p mark. */
+    static bool HasEcnMark(const Ipv6Header& header, uint8_t mark)
+    {
+        return (header.GetEcn() & mark) != 0;
+    }
+
+    /** Set ECN mark bit \p mark on \p header, keeping the other bit. */
+    static void SetEcnMark(Ipv6Header& header, uint8_t mark)
+    {
+        header.SetEcn(Ipv6Header::EcnType(header.GetEcn() | mark));
+    }
+
+    /**
      * \brief Get the type ID.
      * \return the object TypeId
      */

@@ -17,8 +17,16 @@ std::string logFile;
 uint32_t pfcVersion = 0; //!< 1: PFC enabled on the switches
 bool trimEnabled = false;
 bool sourceRouting = false; //!< MRC SRv6 source routing + EV management at the senders
-bool lastHopEcn = true;     //!< ECN on T0 -> server ports (MRC disables it)
 bool ecnAtDequeue = true;   //!< Mark ECN at dequeue (false: at enqueue)
+bool egressAdmission = true; //!< Without PFC: dynamic threshold per egress queue (false: per ingress port)
+bool ecnMarking = true;      //!< Switches set the ECN bit (congestion control) on congestion
+uint32_t ecnKminKB = 100;    //!< RED Kmin for a 100 Gbps port (scaled with the rate), as FASTFLOW
+uint32_t ecnKmaxKB = 0;      //!< RED Kmax for a 100 Gbps port; 0: 4 x Kmin
+double ecnPmax = 1.0;        //!< RED marking probability at Kmax, as FASTFLOW
+uint32_t lbThresholdKB = 100; //!< Load-balancing bit: mark above this queue (100 Gbps port)
+std::string lbMode = "step";  //!< step: every packet above the threshold; flow / packet: a growing share
+                              //!< (queue - threshold) / port buffer, of connections / of packets
+bool lbMarking = true;       //!< Switches set the load-balancing bit (MRC path switching) on congestion
 uint32_t degradeLinks = 0;          //!< Random T0-T1 links running below the plane rate
 std::string degradeRate = "50Gbps"; //!< Rate of a degraded link (both directions)
 
@@ -198,6 +206,16 @@ CreateSwitch(uint32_t plane, uint16_t usid, uint32_t ecmpSeed)
     sw->SetSwitchId(PlaneLocator(plane), usid);
     sw->SetEcmpSeed(ecmpSeed);
     sw->SetPfcEnabled(pfcVersion == 1);
+    sw->SetEgressAdmission(egressAdmission);
+    sw->SetEcnMarking(ecnMarking);
+    sw->SetEcnThresholds(ecnKminKB * 1000, (ecnKmaxKB ? ecnKmaxKB : 4 * ecnKminKB) * 1000, ecnPmax);
+    sw->SetLbMarking(lbMarking);
+    sw->SetLbThreshold(lbThresholdKB * 1000);
+    NS_ABORT_MSG_IF(lbMode != "step" && lbMode != "flow" && lbMode != "packet",
+                    "--lbMode must be step, flow or packet");
+    sw->SetLbMode(lbMode == "flow"     ? SwitchNode::LB_FLOW
+                  : lbMode == "packet" ? SwitchNode::LB_PACKET
+                                       : SwitchNode::LB_STEP);
     sw->SetTrimEnabled(trimEnabled);
     sw->SetEcnAtDequeue(ecnAtDequeue);
     return sw;
@@ -209,8 +227,13 @@ BuildMultiPlane()
     const uint32_t P = topo.numPlanes;
     const uint32_t t0PerPlane = topo.numT0PerPlane;
     const uint32_t t1PerPlane = topo.numT1PerPlane;
+    NS_ABORT_MSG_IF(P == 0 || t0PerPlane == 0 || t1PerPlane == 0 || topo.numServers == 0,
+                    "planes, servers, t0 and t1 must be at least 1");
     NS_ABORT_MSG_IF(topo.numServers % t0PerPlane != 0,
                     "numServers must be a multiple of the T0 switches per plane");
+    // T0 uSIDs 0x0100.. must stay below the T1 uSIDs 0x0200..
+    NS_ABORT_MSG_IF(t0PerPlane > uint32_t(T1Usid(0) - T0Usid(0)), "at most 256 T0 switches per plane");
+    NS_ABORT_MSG_IF(t1PerPlane > uint32_t(0x10000 - T1Usid(0)), "too many T1 switches per plane");
     serversPerT0 = topo.numServers / t0PerPlane;
 
     servers.resize(topo.numServers);
@@ -248,7 +271,7 @@ BuildMultiPlane()
             nic->SetDeviceType(PointToPointNetDevice::NetDeviceType::SERVER);
             nics[s][p] = nic;
             t0->AddRoute(RdmaSender::GetHostAddress(s), t0->GetNDevices() - 1);
-            t0->SetEcnEnabled(t0->GetNDevices() - 1, lastHopEcn);
+            t0->SetLbEnabled(t0->GetNDevices() - 1, false); // the last hop says nothing about the path
         }
 
         // T0 <-> T1 full mesh

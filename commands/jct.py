@@ -13,10 +13,20 @@ Usage:
   commands/jct.py RESULTS...           per run: job time, iterations, collectives
   commands/jct.py RESULTS --phases     also the mean duration of every phase kind
   commands/jct.py RESULTS --iters      also every iteration of every run
+  commands/jct.py RESULTS --iter 1     only the second iteration (0-based; also 1,2,...)
 
 Job time = last phase end - first phase start. Iteration N ends at its barrier
 (iter<N>.*.end or iter<N>.end) and starts where the previous one ended.
-Collective statistics are over every group / stage collective of every iteration.
+Collective statistics are over every group / stage collective of every iteration,
+or only of the iterations given with --iter (0-based: --iter 1 is the second,
+e.g. to skip the first while congestion control settles).
+
+ideal_us is a bandwidth lower bound on one iteration, from the run's own
+messages (.fct), topology and degraded links (out.txt): every NIC, every T0's
+uplinks / downlinks and every T0 pair's T1 paths must carry their bytes, with
+each message split evenly over the planes (see common.network_bound; no
+latency, headers or compute). eff = ideal_us / iter_mean_us. --bound shows
+which part limits it, and the bound when load may also shift between planes.
 """
 import argparse
 import re
@@ -24,7 +34,7 @@ from collections import defaultdict
 
 import numpy as np
 
-from common import find_files, print_table, run_label
+from common import find_files, network_bound, print_table, run_label
 
 COLLECTIVE = re.compile(r"^iter\d+\.(.+)\.(g|s)\d+$")
 PHASE = re.compile(r"^iter(\d+)\.(.+)$")
@@ -40,7 +50,9 @@ def load(path):
     return phases
 
 
-def analyze(phases):
+def analyze(phases, select=None):
+    """select: iteration numbers to keep (None: all) for iterations, collectives and phases."""
+    keep = lambda name: select is None or (PHASE.match(name) and int(PHASE.match(name).group(1)) in select)
     complete = all(done == tasks for _, _, _, _, tasks, done in phases)
     started = [p for p in phases if p[1] >= 0]
     job = max(p[2] for p in started) - min(p[1] for p in started) if started else float("nan")
@@ -54,15 +66,16 @@ def analyze(phases):
     iters = []
     prev = min(p[1] for p in started) if started else 0
     for it in sorted(iter_end):
-        iters.append(iter_end[it] - prev)
+        if select is None or it in select:
+            iters.append((it, iter_end[it] - prev))
         prev = iter_end[it]
 
     collectives = sorted(dur for name, _, _, dur, tasks, done in started
-                         if COLLECTIVE.match(name) and done == tasks)
+                         if COLLECTIVE.match(name) and done == tasks and keep(name))
     kinds = defaultdict(list)
     for name, _, _, dur, *_ in started:
         m = PHASE.match(name)
-        if m:
+        if m and keep(name):
             kinds[re.sub(r"\.(g|s)\d+$", ".*", m.group(2))].append(dur)
     return complete, job, iters, collectives, kinds
 
@@ -72,29 +85,43 @@ def main():
     ap.add_argument("paths", nargs="+", help=".jct files or directories containing them")
     ap.add_argument("--phases", action="store_true", help="mean duration of every phase kind")
     ap.add_argument("--iters", action="store_true", help="every iteration of every run")
+    ap.add_argument("--bound", action="store_true", help="parts of the ideal (NIC, T0 up/down, T0 pair)")
+    ap.add_argument("--iter", metavar="N[,N...]",
+                    help="only these iterations (0-based, e.g. 1 = the second) for iter_mean_us, eff, "
+                         "the collective statistics and --phases / --iters; job_us is still the whole job")
     ap.add_argument("--csv", metavar="CSV", help="also write the main table as CSV")
     args = ap.parse_args()
+    select = {int(x) for x in args.iter.split(",")} if args.iter else None
 
     files = find_files(args.paths, "*.jct")
-    rows, iter_rows, phase_rows = [], [], []
+    rows, iter_rows, phase_rows, bound_rows = [], [], [], []
     q = lambda a, p: float(np.percentile(a, p)) if len(a) else float("nan")
     for path in files:
         label = run_label(path, files)
-        complete, job, iters, coll, kinds = analyze(load(path))
+        complete, job, iters, coll, kinds = analyze(load(path), select)
+        bound = network_bound(path)
+        iter_mean = float(np.mean([t for _, t in iters])) if iters else float("nan")
+        ideal = bound["equal"] if bound else float("nan")
         rows.append([label + ("" if complete else " (INCOMPLETE)"), job, len(iters),
-                     float(np.mean(iters)) if iters else float("nan"),
+                     iter_mean, ideal, ideal / iter_mean if iter_mean else float("nan"),
                      len(coll), float(np.mean(coll)) if coll else float("nan"),
                      q(coll, 50), q(coll, 99), coll[0] if coll else float("nan"),
                      coll[-1] if coll else float("nan")])
-        iter_rows += [[label, i, t] for i, t in enumerate(iters)]
+        iter_rows += [[label, i, t] for i, t in iters]
+        if bound:
+            bound_rows.append([label] + [bound[k] for k in ("equal", "nic", "up", "down", "pair", "any")])
         phase_rows += [[label, k, len(v), float(np.mean(v)), float(np.max(v))]
                        for k, v in sorted(kinds.items())]
 
-    print_table(["run", "job_us", "iters", "iter_mean_us", "collectives", "coll_mean_us",
+    print_table(["run", "job_us", "iters", "iter_mean_us", "ideal_us", "eff", "collectives", "coll_mean_us",
                  "coll_p50_us", "coll_p99_us", "coll_min_us", "coll_max_us"], rows, args.csv)
     if args.iters:
         print()
         print_table(["run", "iteration", "time_us"], iter_rows)
+    if args.bound:
+        print()
+        print_table(["run", "ideal_us", "nic_us", "t0_up_us", "t0_down_us", "t0_pair_us", "any_split_us"],
+                    bound_rows)
     if args.phases:
         print()
         print_table(["run", "phase", "count", "mean_us", "max_us"], phase_rows)

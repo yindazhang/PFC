@@ -5,8 +5,8 @@ Usage:
   commands/stats.py RESULTS...        one row per run (an out.txt or any directory above it)
   commands/stats.py RESULTS --csv x   also write the table as CSV
 
-Columns: data packets, retransmissions (% of packets), RTOs, trim NACKs, EVs
-retired / restored (SRv6), switch drops / trims / ECN marks, T0->T1 load
+Columns: data packets, retransmissions (% of packets), RTOs, trim NACKs, EV
+swaps (SRv6), switch drops / trims / ECN marks / load-balancing marks / largest egress queue, T0->T1 load
 imbalance (max/mean bytes over all T0->T1 links), messages, and the wall-clock
 time and peak memory of the run (time.txt, written by commands/run.sh).
 """
@@ -21,11 +21,12 @@ PATTERNS = {
     "retx": r"(\d+) retransmissions",
     "rtos": r"(\d+) RTOs",
     "trimNacks": r"(\d+) trim NACKs",
-    "evRetired": r"(\d+) EVs retired",
-    "evRestored": r"\((\d+) restored\)",
+    "evSwaps": r"(\d+) EV swaps",
     "drops": r"Switches: (\d+) drops",
     "trims": r"(\d+) trims",
     "ecnMarks": r"(\d+) ECN marks",
+    "lbMarks": r"(\d+) LB marks",
+    "maxQueueKB": r"max queue (\d+) KB",
     "imbalance": r"all T0->T1: .* max/mean ([\d.]+)",
     "messages": r"Messages: (\d+)",
 }
@@ -58,8 +59,8 @@ def main():
     args = ap.parse_args()
 
     files = find_files(args.paths, "out.txt")
-    header = ["run", "status", "packets", "retx", "retx%", "rtos", "trimNacks", "evRetired",
-              "evRestored", "drops", "trims", "ecnMarks", "imbalance", "messages", "wall_s", "mem_GB"]
+    header = ["run", "status", "packets", "retx", "retx%", "rtos", "trimNacks", "evSwaps",
+              "drops", "trims", "ecnMarks", "lbMarks", "maxQueueKB", "imbalance", "messages", "wall_s", "mem_GB"]
     rows = []
     for path in files:
         r = parse(path)

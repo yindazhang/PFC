@@ -13,7 +13,28 @@
 #   spray_trim      packet spraying, trimming
 #   srv6half_lossy  MRC SRv6 source routing, half of the paths active, drop
 #   srv6half_trim   MRC SRv6 source routing, half of the paths active, trimming
-#   srv6all_trim    MRC SRv6 source routing, all 16 paths per plane active, trimming
+#   srv6all_trim    MRC SRv6 source routing, all paths per plane active, trimming
+#
+# Topology (defaults 4 planes, 256 servers, 16 T0 + 16 T1 per plane, non-blocking):
+#   --planes=P --servers=N --t0=A --t1=B    N servers / A T0s per T0; B > N/A is
+#   undersubscribed, B < N/A oversubscribed. Like any option they can be swept.
+#
+# Congestion marks (two bits of the IPv6 ECN field, decided separately):
+#   --ecnMark=0|1   ECN bit, read by congestion control, on every port or none;
+#                   default on, off with SRv6
+#   --lbMark=0|1    load-balancing bit, read by SRv6 path switching; default on,
+#                   never on the last hop (T0 -> server)
+#   --lbThreshold=KB  the LB bit is set on every packet above this egress queue,
+#                   never below (KB for a 100 Gbps port; default 100)
+#   --lbMode=step|flow|packet  above the threshold, mark every packet (step,
+#                   default); or with p = (queue - lbThreshold) / port buffer,
+#                   the connections with hash(src,dst,switch,port)/2^32 < p
+#                   (flow), or each packet with probability p (packet)
+#   --ecnKmin/--ecnKmax/--ecnPmax  RED for the ECN bit (default 100/400 KB, 1.0)
+#   --evOnLb=0|1    SRv6 path switching on the LB mark (default 1)
+#   --evOnLoss=0|1  SRv6 path switching on a trim NACK or an RTO (default 1)
+#   --ecnIgnoreOnLb=0|1  congestion control ignores ECN on packets that also
+#                   carry the LB mark (default 0)
 #
 # Script options:
 #   -t NAME   experiment name: results go to <results>/NAME (default: date-time)
@@ -39,6 +60,7 @@
 #   commands/run.sh -t deg -j 6 --workload=permutation --config=ecmp_pfc,spray_trim,srv6half_trim \
 #                   --degradeLinks=0,64,256
 #   commands/run.sh -n --workload=training --iters=2 --pp=4,8
+#   commands/run.sh -t sub -j 6 --workload=allreduce --config=spray_trim,srv6half_trim --t1=8,16,32
 
 set -euo pipefail
 
@@ -98,7 +120,7 @@ preset() {
     spray_trim) echo "--spray=1 --srcRoute=0 --pfc=0 --trim=1" ;;
     srv6half_lossy) echo "--srcRoute=1 --pfc=0 --trim=0" ;;
     srv6half_trim) echo "--srcRoute=1 --pfc=0 --trim=1" ;;
-    srv6all_trim) echo "--srcRoute=1 --pfc=0 --trim=1 --ns3::RdmaSender::EvsPerPlane=16" ;;
+    srv6all_trim) echo "--srcRoute=1 --pfc=0 --trim=1 --ns3::RdmaSender::EvsPerPlane=65535" ;; # clamped to the paths per plane
     *)
         echo "Unknown --config preset '$1'" >&2
         exit 1

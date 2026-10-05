@@ -13,7 +13,6 @@
 #include "ns3/packet.h"
 
 #include <deque>
-#include <map>
 #include <random>
 #include <set>
 #include <vector>
@@ -53,14 +52,24 @@ struct QpInfo
  *   - Default: hash-based ECMP. With PacketSpraying, a fresh EV per packet.
  *   - SourceRouting (MRC with static SRv6): every EV maps to one SRv6 path
  *     given with AddPath() (plane + switches). At startup the sender picks
- *     EvsPerPlane random paths per plane as the active EV set (the rest are
- *     backups) and each plane sends on its own active EVs in turn:
- *       * ECN on a SACK (or a trim NACK) for an EV: skip it for EcnSkipRtts
- *         base RTTs (ECN as a load-balancing signal);
- *       * loss that is not a trim (reorder detection, RTO): the EV is
- *         ASSUMED_BAD and replaced by a backup EV of the same plane, as long
- *         as at least EvMinActive EVs stay active. (No EV probes: an
- *         ASSUMED_BAD EV is not resurrected.)
+ *     EvsPerPlane random paths per plane as the active EV set; the rest form
+ *     the plane's backup queue (FIFO). The target is half of the plane's
+ *     paths (rounded up; less if EvsPerPlane is smaller), even when all
+ *     paths start active. Each plane sprays over all of its active EVs in
+ *     turn. Without EV probes there is no skip / bad state:
+ *       * a load-balancing mark on a SACK (PointToPointQueue::ECN_MARK_LB,
+ *         not ECN: ECN only drives congestion control), a trim NACK, or an
+ *         RTO on the oldest outstanding packet, for an active EV: that EV leaves the active set
+ *         and goes to the back of its plane's backup queue;
+ *       * whenever a plane has fewer active EVs than its target, the front
+ *         of its backup queue rejoins the active set. So with all paths
+ *         active, signalled paths are left out until only half remain; with
+ *         half active, the queue front replaces a signalled EV at once;
+ *       * signals for an EV that is already a backup are ignored;
+ *       * reorder-detected losses and duplicate SACKs do not change EVs:
+ *         under spraying they are reordering, not failed paths.
+ *     Each trigger can be turned off: EvOnLb (the LB mark) and EvOnLoss (trim
+ *     NACK and RTO). ECN never moves paths.
  *
  * Reliability: selective. SACKs advance the cumulative ack and mark
  * out-of-order arrivals; NACKs (trimmed / out of MPR) and time-based reorder
@@ -145,9 +154,8 @@ public:
         uint64_t reorderLosses{0};   //!< Packets declared lost by reorder detection
         uint64_t spuriousDetections{0}; //!< Reorder-window widenings (spurious losses seen)
         uint64_t trimNacks{0};
-        uint64_t evSkips{0};         //!< ECN / trim signals on an EV
-        uint64_t evFailures{0};      //!< EVs retired as ASSUMED_BAD
-        uint64_t evRestores{0};      //!< Retired EVs brought back (the loss was spurious)
+        uint64_t evSwaps{0};         //!< Active EVs moved to the backup queue (ECN / trim / RTO)
+        uint64_t evRejoins{0};       //!< Backup EVs moved back into the active set
     };
 
     static const GlobalStats& GetGlobalStats() { return s_stats; }
@@ -184,18 +192,10 @@ private:
         uint32_t numPackets;
     };
 
-    enum EvState : uint8_t
-    {
-        EV_GOOD,
-        EV_ASSUMED_BAD,
-    };
-
     struct EntropyValue
     {
         uint32_t plane;
         Srv6Sid path;
-        EvState state{EV_GOOD};
-        int64_t skipUntil{0}; //!< ns: skipped after an ECN / trim signal
     };
 
     PacketInfo& Info(uint32_t psn) { return m_window[psn % m_window.size()]; }
@@ -228,11 +228,11 @@ private:
     // EV management (SourceRouting)
     void BuildEvSet(uint32_t plane);
     int32_t SelectEv(uint32_t plane);
-    void OnEvCongested(int32_t ev);
-    /** Retire \p ev after the loss of \p psn (may be undone by RestoreEv). */
-    void OnEvLoss(int32_t ev, uint32_t psn);
-    /** A duplicate SACK proved \p psn was delivered: bring back the EV retired for it. */
-    void RestoreEv(uint32_t psn);
+    /**
+     * ECN, trim or RTO on \p ev: if active, move it to the back of its plane's
+     * backup queue, then refill the active set from the queue front up to the target.
+     */
+    void OnEvSignal(int32_t ev);
 
     // NSCC
     void UpdateLimits();
@@ -260,9 +260,10 @@ private:
     double m_fairIncrease;    //!< BDP fraction added per window of acked bytes (fi)
     uint32_t m_fastIncrease;  //!< MTUs added per ack during Fast Increase (k)
     bool m_sourceRouting;     //!< SRv6 source routing + EV management
+    bool m_ecnIgnoreOnLb;     //!< Congestion control ignores ECN when the LB mark is also set
+    bool m_evOnLb;            //!< Path switching on the LB mark
+    bool m_evOnLoss;          //!< Path switching on a trim NACK or an RTO
     uint32_t m_evsPerPlane;   //!< Active EVs per plane (0: half of its paths)
-    uint32_t m_evMinActive;   //!< Minimum active EVs per plane
-    double m_ecnSkipRtts;     //!< EV skip time after ECN, in base RTTs
 
     uint32_t m_mtu{0};
 
@@ -274,10 +275,10 @@ private:
     std::vector<EntropyValue> m_evs;
     std::vector<std::vector<uint32_t>> m_planePaths; //!< [plane] -> EVs added by AddPath
     std::vector<std::vector<uint32_t>> m_activeEvs;  //!< [plane] -> active EVs, rotated
-    std::vector<std::vector<uint32_t>> m_backupEvs;  //!< [plane] -> spare GOOD EVs
+    std::vector<std::deque<uint32_t>> m_backupEvs;   //!< [plane] -> backup EVs, FIFO
     std::vector<uint32_t> m_evCursor;                //!< [plane] -> next active EV
+    std::vector<uint32_t> m_evTarget;                //!< [plane] -> minimum active EVs (half the paths)
     std::mt19937 m_evRng;
-    std::map<uint32_t, uint32_t> m_retiredFor; //!< PSN whose loss retired an EV -> that EV
     std::vector<uint32_t> m_ecmpEvs; //!< Hash-based EV set (EcmpEvSetSize > 0), rotated
     uint32_t m_ecmpEvSetSize;
     static GlobalStats s_stats;
@@ -295,7 +296,7 @@ private:
     std::set<uint32_t> m_lost;        //!< PSNs to retransmit, earliest first
     uint64_t m_inflightBytes{0};
     int64_t m_rackXmitTime{-1}; //!< Latest send time of an acknowledged packet (ns)
-    double m_reorderWindowRtts{1.0}; //!< Current reorder window, in base RTTs
+    double m_reorderWindowRtts{8.0}; //!< Current reorder window, in base RTTs
 
     Time m_rto;
     EventId m_rtoEvent;
