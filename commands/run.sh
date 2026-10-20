@@ -14,27 +14,26 @@
 #   srv6half_lossy  MRC SRv6 source routing, half of the paths active, drop
 #   srv6half_trim   MRC SRv6 source routing, half of the paths active, trimming
 #   srv6all_trim    MRC SRv6 source routing, all paths per plane active, trimming
+#   reps_trim       REPS over ECMP flow labels, trimming
+#   srv6reps_trim   REPS over SRv6 paths, trimming
 #
 # Topology (defaults 4 planes, 256 servers, 16 T0 + 16 T1 per plane, non-blocking):
 #   --planes=P --servers=N --t0=A --t1=B    N servers / A T0s per T0; B > N/A is
 #   undersubscribed, B < N/A oversubscribed. Like any option they can be swept.
 #
-# Congestion marks (two bits of the IPv6 ECN field, decided separately):
-#   --ecnMark=0|1   ECN bit, read by congestion control, on every port or none;
-#                   default on, off with SRv6
-#   --lbMark=0|1    load-balancing bit, read by SRv6 path switching; default on,
-#                   never on the last hop (T0 -> server)
-#   --lbThreshold=KB  the LB bit is set on every packet above this egress queue,
-#                   never below (KB for a 100 Gbps port; default 100)
-#   --lbMode=step|flow|packet  above the threshold, mark every packet (step,
-#                   default); or with p = (queue - lbThreshold) / port buffer,
-#                   the connections with hash(src,dst,switch,port)/2^32 < p
-#                   (flow), or each packet with probability p (packet)
+# Congestion marks:
+#   --ecnMark=0|1   ECN bit, read by congestion control and path selection, on
+#                   every port or none (default on)
+#   --lastHopEcn=0|1  also mark ECN on the last hop T0 -> server (default 0)
 #   --ecnKmin/--ecnKmax/--ecnPmax  RED for the ECN bit (default 100/400 KB, 1.0)
-#   --evOnLb=0|1    SRv6 path switching on the LB mark (default 1)
+#   --evOnEcn=0|1   SRv6 path switching on an ECN mark (default 1)
 #   --evOnLoss=0|1  SRv6 path switching on a trim NACK or an RTO (default 1)
-#   --ecnIgnoreOnLb=0|1  congestion control ignores ECN on packets that also
-#                   carry the LB mark (default 0)
+#
+# Load balancing:
+#   --lb=mrc|reps   mrc (default): ECMP / spraying, or with --srcRoute the MRC
+#                   active + backup EV sets; reps: Recycled Entropy Packet
+#                   Spraying, over flow labels or (--srcRoute) SRv6 paths. Tune with
+#                   --ns3::RdmaSender::RepsBufferSize / RepsExplorePackets
 #
 # Script options:
 #   -t NAME   experiment name: results go to <results>/NAME (default: date-time)
@@ -121,6 +120,8 @@ preset() {
     srv6half_lossy) echo "--srcRoute=1 --pfc=0 --trim=0" ;;
     srv6half_trim) echo "--srcRoute=1 --pfc=0 --trim=1" ;;
     srv6all_trim) echo "--srcRoute=1 --pfc=0 --trim=1 --ns3::RdmaSender::EvsPerPlane=65535" ;; # clamped to the paths per plane
+    reps_trim) echo "--lb=reps --spray=1 --srcRoute=0 --pfc=0 --trim=1" ;;
+    srv6reps_trim) echo "--lb=reps --srcRoute=1 --pfc=0 --trim=1" ;;
     *)
         echo "Unknown --config preset '$1'" >&2
         exit 1

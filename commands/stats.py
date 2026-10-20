@@ -6,7 +6,7 @@ Usage:
   commands/stats.py RESULTS --csv x   also write the table as CSV
 
 Columns: data packets, retransmissions (% of packets), RTOs, trim NACKs, EV
-swaps (SRv6), switch drops / trims / ECN marks / load-balancing marks / largest egress queue, T0->T1 load
+swaps (MRC SRv6), REPS random EVs, switch drops / trims / ECN marks / largest egress queue, T0->T1 load
 imbalance (max/mean bytes over all T0->T1 links), messages, and the wall-clock
 time and peak memory of the run (time.txt, written by commands/run.sh).
 """
@@ -22,10 +22,10 @@ PATTERNS = {
     "rtos": r"(\d+) RTOs",
     "trimNacks": r"(\d+) trim NACKs",
     "evSwaps": r"(\d+) EV swaps",
+    "repsRandom": r"REPS \d+ recycled / (\d+) random EVs",
     "drops": r"Switches: (\d+) drops",
     "trims": r"(\d+) trims",
     "ecnMarks": r"(\d+) ECN marks",
-    "lbMarks": r"(\d+) LB marks",
     "maxQueueKB": r"max queue (\d+) KB",
     "imbalance": r"all T0->T1: .* max/mean ([\d.]+)",
     "messages": r"Messages: (\d+)",
@@ -59,8 +59,8 @@ def main():
     args = ap.parse_args()
 
     files = find_files(args.paths, "out.txt")
-    header = ["run", "status", "packets", "retx", "retx%", "rtos", "trimNacks", "evSwaps",
-              "drops", "trims", "ecnMarks", "lbMarks", "maxQueueKB", "imbalance", "messages", "wall_s", "mem_GB"]
+    header = ["run", "status", "packets", "retx", "retx%", "rtos", "trimNacks", "evSwaps", "repsRandom",
+              "drops", "trims", "ecnMarks", "maxQueueKB", "imbalance", "messages", "wall_s", "mem_GB"]
     rows = []
     for path in files:
         r = parse(path)

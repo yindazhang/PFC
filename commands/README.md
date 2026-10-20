@@ -29,6 +29,8 @@ every combination of the options you give it.
   | `srv6half_lossy` | MRC SRv6 source routing, half the paths active, drop |
   | `srv6half_trim` | MRC SRv6 source routing, half the paths active, trimming |
   | `srv6all_trim` | MRC SRv6 source routing, all paths per plane active, trimming |
+  | `reps_trim` | REPS over ECMP flow labels, trimming |
+  | `srv6reps_trim` | REPS over SRv6 paths, trimming |
 
 - **Script options** go before the simulator options:
 
@@ -78,13 +80,11 @@ commands/run.sh -n --workload=allreduce --config=ecmp_pfc,spray_trim --bytes=160
 | `--act` / `--grad` | 8 MB / 64 MB | training: activation per micro-batch / gradient per rank |
 | `--fwdUs` / `--bwdUs` | 500 / 1000 | training: compute per micro-batch (µs) |
 | `--degradeLinks` / `--degradeRate` | 0 / 50Gbps | random T0-T1 links slowed down |
-| `--ecnMark` | -1 | switches set the ECN bit (congestion control); -1 = on, but off with `--srcRoute` |
+| `--ecnMark` | 1 | switches set the ECN bit (congestion control and path selection) |
+| `--lastHopEcn` | 0 | also mark ECN on the last hop (T0 → server), which every path shares |
+| `--lb` | mrc | load balancing: `mrc` (ECMP / spraying, or with `--srcRoute` the MRC active + backup EV sets) or `reps` (Recycled Entropy Packet Spraying, over flow labels or with `--srcRoute` over SRv6 paths; tune with `--ns3::RdmaSender::RepsBufferSize` (8), `RepsExplorePackets` (0 = one BDP per plane); no freezing mode) |
 | `--ecnKmin` / `--ecnKmax` / `--ecnPmax` | 100 / 0 / 1.0 | RED marking of the ECN bit: thresholds in KB for a 100 Gbps port (scaled with the rate; Kmax 0 = 4 × Kmin) and the probability at Kmax |
-| `--lbThreshold` | 100 | LB bit: set on every packet while the egress queue is above this (KB for a 100 Gbps port), never below |
-| `--lbMode` | step | LB bit above `--lbThreshold`: `step` marks every packet; `flow` marks only connections with hash(src, dst, switch, port) / 2³² < p, p = (queue − threshold) / port buffer, a share that grows with the queue; `packet` marks each packet with the same probability p (random per packet instead of per connection) |
-| `--evOnLb` / `--evOnLoss` | 1 / 1 | SRv6 path switching on the LB mark / on a trim NACK or an RTO (ECN never switches paths) |
-| `--ecnIgnoreOnLb` | 0 | congestion control ignores the ECN of a packet that also carried the LB mark (treated as unmarked) |
-| `--lbMark` | 1 | switches set the load-balancing bit (only SRv6 path switching reads it; never on the last hop T0 → server) |
+| `--evOnEcn` / `--evOnLoss` | 1 / 1 | MRC SRv6 path switching on an ECN mark / on a trim NACK or an RTO |
 | `--egressAdmission` | 1 | without PFC: shared-buffer admission per egress queue (0: per ingress port) |
 | `--planes` / `--servers` | 4 / 256 | topology: planes (NICs per server) / servers (one GPU each) |
 | `--t0` / `--t1` | 16 / 16 | topology: T0 / T1 switches per plane. `servers` must be a multiple of `t0` (at most 256). `t1` = servers per T0 is non-blocking; more is undersubscribed, fewer oversubscribed |

@@ -17,11 +17,9 @@ main(int argc, char* argv[])
     uint32_t mtuShift = 12;
     double stopTime = 10.0;
     bool spray = true;
-    bool ecnIgnoreOnLb = false;
-    bool evOnLb = true;
+    std::string lb = "mrc";
+    bool evOnEcn = true;
     bool evOnLoss = true;
-    int ecnMark = -1; // -1: on unless srcRoute
-    bool lbMark = true; // only SRv6 senders read it
     AiWorkloadConfig work;
 
     CommandLine cmd(__FILE__);
@@ -63,30 +61,17 @@ main(int argc, char* argv[])
                  topo.numT1PerPlane);
     cmd.AddValue("spray", "per-packet spraying (new flow label per packet); 0: per-flow ECMP", spray);
     cmd.AddValue("srcRoute", "MRC SRv6 source routing + EV management (overrides spray)", sourceRouting);
-    cmd.AddValue("ecnMark",
-                 "switches set the ECN bit (congestion control); -1: on unless srcRoute", ecnMark);
+    cmd.AddValue("ecnMark", "switches set the ECN bit (congestion control)", ecnMarking);
     cmd.AddValue("ecnKmin", "RED Kmin (KB) for a 100 Gbps port, scaled with the rate", ecnKminKB);
     cmd.AddValue("ecnKmax", "RED Kmax (KB) for a 100 Gbps port; 0: 4 x ecnKmin", ecnKmaxKB);
     cmd.AddValue("ecnPmax", "RED marking probability at Kmax", ecnPmax);
-    cmd.AddValue("lbThreshold",
-                 "load-balancing bit: mark every packet while the egress queue is above this "
-                 "(KB for a 100 Gbps port, scaled with the rate)",
-                 lbThresholdKB);
-    cmd.AddValue("lbMode",
-                 "load-balancing bit above lbThreshold: step (every packet), flow (connections "
-                 "with hash(src, dst, switch, port) < p) or packet (each packet with probability "
-                 "p), p = (queue - lbThreshold) / port buffer",
-                 lbMode);
-    cmd.AddValue("evOnLb", "srcRoute: the load-balancing mark switches paths", evOnLb);
+    cmd.AddValue("lb",
+                 "load balancing: mrc (ECMP / spray, or SRv6 active and backup EV sets) or reps "
+                 "(Recycled Entropy Packet Spraying, on flow labels or on SRv6 paths with srcRoute)",
+                 lb);
+    cmd.AddValue("evOnEcn", "srcRoute: an ECN mark switches paths", evOnEcn);
     cmd.AddValue("evOnLoss", "srcRoute: a trim NACK or an RTO switches paths", evOnLoss);
-    cmd.AddValue("ecnIgnoreOnLb",
-                 "congestion control ignores the ECN of a packet that also carried the "
-                 "load-balancing mark",
-                 ecnIgnoreOnLb);
-    cmd.AddValue("lbMark",
-                 "switches set the load-balancing bit (MRC path switching; only srcRoute senders "
-                 "read it; never on the last hop)",
-                 lbMark);
+    cmd.AddValue("lastHopEcn", "also mark ECN on the last hop (T0 -> server)", lastHopEcn);
     cmd.AddValue("ecnDequeue", "mark ECN at dequeue (0: at enqueue)", ecnAtDequeue);
     cmd.AddValue("degradeLinks", "number of random T0-T1 links running at degradeRate", degradeLinks);
     cmd.AddValue("degradeRate", "rate of a degraded T0-T1 link", degradeRate);
@@ -103,12 +88,14 @@ main(int argc, char* argv[])
     Config::SetDefault("ns3::RdmaSender::MtuShift", UintegerValue(mtuShift));
     Config::SetDefault("ns3::RdmaSender::PacketSpraying", BooleanValue(spray));
     Config::SetDefault("ns3::RdmaSender::SourceRouting", BooleanValue(sourceRouting));
-    Config::SetDefault("ns3::RdmaSender::EcnIgnoreOnLb", BooleanValue(ecnIgnoreOnLb));
-    Config::SetDefault("ns3::RdmaSender::EvOnLb", BooleanValue(evOnLb));
+    if (lb != "mrc" && lb != "reps")
+    {
+        std::cerr << "Unknown --lb=" << lb << ". Use mrc or reps." << std::endl;
+        return 1;
+    }
+    Config::SetDefault("ns3::RdmaSender::LoadBalancing", StringValue(lb == "reps" ? "Reps" : "Mrc"));
+    Config::SetDefault("ns3::RdmaSender::EvOnEcn", BooleanValue(evOnEcn));
     Config::SetDefault("ns3::RdmaSender::EvOnLoss", BooleanValue(evOnLoss));
-    // SRv6: path switching uses the load-balancing bit, and switches mark it instead of ECN
-    ecnMarking = ecnMark < 0 ? !sourceRouting : ecnMark != 0;
-    lbMarking = lbMark;
 
     std::string name = work.type == "trace" ? flowFile + "s" : work.type;
     std::filesystem::create_directories("logs");
@@ -116,8 +103,9 @@ main(int argc, char* argv[])
               std::to_string(topo.numServers) + "_T" + std::to_string(topo.numT0PerPlane) + "x" +
               std::to_string(topo.numT1PerPlane) + "_PFC" +
               std::to_string(pfcVersion) + "_TRIM" + std::to_string(trimEnabled) +
-              (sourceRouting ? std::string("_SRV6") : "_SPRAY" + std::to_string(spray)) + "_ECN" +
-              std::to_string(ecnMarking) + std::to_string(lbMarking) + (ecnAtDequeue ? "D" : "E") +
+              (sourceRouting ? std::string("_SRV6") : "_SPRAY" + std::to_string(spray)) +
+              (lb == "reps" ? "_REPS" : "") + "_ECN" +
+              std::to_string(ecnMarking) + (ecnAtDequeue ? "D" : "E") +
               "_DEG" +
               std::to_string(degradeLinks) + "_MTU" + std::to_string(1u << mtuShift);
 
@@ -156,11 +144,13 @@ main(int argc, char* argv[])
     std::cout << "Senders: " << st.packets << " data packets, " << st.retransmissions
               << " retransmissions, " << st.rtos << " RTOs, " << st.reorderLosses
               << " reorder losses (" << st.spuriousDetections << " spurious seen), " << st.trimNacks << " trim NACKs, " << st.evSwaps
-              << " EV swaps (" << st.evRejoins << " rejoined)" << std::endl;
+              << " EV swaps (" << st.evRejoins << " rejoined), REPS " << st.repsRecycledEvs
+              << " recycled / " << st.repsRandomEvs << " random EVs (" << st.repsExploreEvs << " exploring), "
+              << st.repsOverwritten << " overwritten"
+              << std::endl;
     uint64_t drops = 0;
     uint64_t trims = 0;
     uint64_t marks = 0;
-    uint64_t lbMarks = 0;
     int32_t maxQueue = 0;
     for (auto* tier : {&t0s, &t1s})
     {
@@ -171,13 +161,12 @@ main(int argc, char* argv[])
                 drops += sw->GetDropCount();
                 trims += sw->GetTrimCount();
                 marks += sw->GetEcnMarkCount();
-                lbMarks += sw->GetLbMarkCount();
                 maxQueue = std::max(maxQueue, sw->GetMaxEgressUsed());
             }
         }
     }
     std::cout << "Switches: " << drops << " drops, " << trims << " trims, " << marks
-              << " ECN marks, " << lbMarks << " LB marks, max queue " << maxQueue / 1000 << " KB. Fabric load:" << std::endl;
+              << " ECN marks, max queue " << maxQueue / 1000 << " KB. Fabric load:" << std::endl;
     PrintFabricLoad(std::cout);
 
     std::chrono::duration<double> diff = std::chrono::system_clock::now() - start;

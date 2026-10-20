@@ -764,7 +764,7 @@ PointToPointNetDevice::ReceiveRdma(Ptr<Packet> packet)
         {
             return; // not a QP of this host
         }
-        it->second.sender->Receive(packet);
+        it->second.sender->Receive(packet, it->second.plane); // SACKs return on the data's plane
     }
     else if (bthHeader.IsMrcRequest())
     {

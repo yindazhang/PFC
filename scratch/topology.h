@@ -20,13 +20,10 @@ bool sourceRouting = false; //!< MRC SRv6 source routing + EV management at the 
 bool ecnAtDequeue = true;   //!< Mark ECN at dequeue (false: at enqueue)
 bool egressAdmission = true; //!< Without PFC: dynamic threshold per egress queue (false: per ingress port)
 bool ecnMarking = true;      //!< Switches set the ECN bit (congestion control) on congestion
+bool lastHopEcn = false;     //!< ECN also on the last hop (T0 -> server), which every path shares
 uint32_t ecnKminKB = 100;    //!< RED Kmin for a 100 Gbps port (scaled with the rate), as FASTFLOW
 uint32_t ecnKmaxKB = 0;      //!< RED Kmax for a 100 Gbps port; 0: 4 x Kmin
 double ecnPmax = 1.0;        //!< RED marking probability at Kmax, as FASTFLOW
-uint32_t lbThresholdKB = 100; //!< Load-balancing bit: mark above this queue (100 Gbps port)
-std::string lbMode = "step";  //!< step: every packet above the threshold; flow / packet: a growing share
-                              //!< (queue - threshold) / port buffer, of connections / of packets
-bool lbMarking = true;       //!< Switches set the load-balancing bit (MRC path switching) on congestion
 uint32_t degradeLinks = 0;          //!< Random T0-T1 links running below the plane rate
 std::string degradeRate = "50Gbps"; //!< Rate of a degraded link (both directions)
 
@@ -172,6 +169,9 @@ PrintFabricLoad(std::ostream& os)
     };
     std::vector<uint64_t> allUp;
     std::vector<uint64_t> allDown;
+    std::vector<uint64_t> degradedUp; //!< Over degraded links only (below the plane rate)
+    std::vector<uint64_t> healthyUp;
+    DataRate planeRate(topo.linkRate);
     for (uint32_t p = 0; p < topo.numPlanes; p++)
     {
         std::vector<uint64_t> up;
@@ -180,7 +180,10 @@ PrintFabricLoad(std::ostream& os)
         {
             for (uint32_t j = 0; j < topo.numT1PerPlane; j++)
             {
-                up.push_back(t0->GetTxBytes(serversPerT0 + j));
+                uint64_t bytes = t0->GetTxBytes(serversPerT0 + j);
+                up.push_back(bytes);
+                auto dev = DynamicCast<PointToPointNetDevice>(t0->GetDevice(serversPerT0 + j));
+                (dev->GetDataRate() < planeRate ? degradedUp : healthyUp).push_back(bytes);
             }
         }
         for (auto& t1 : t1s[p])
@@ -197,6 +200,11 @@ PrintFabricLoad(std::ostream& os)
     }
     summary("all T0->T1", allUp);
     summary("all T1->T0", allDown);
+    if (!degradedUp.empty())
+    {
+        summary("degraded T0->T1", degradedUp);
+        summary("healthy T0->T1", healthyUp);
+    }
 }
 
 Ptr<SwitchNode>
@@ -209,13 +217,6 @@ CreateSwitch(uint32_t plane, uint16_t usid, uint32_t ecmpSeed)
     sw->SetEgressAdmission(egressAdmission);
     sw->SetEcnMarking(ecnMarking);
     sw->SetEcnThresholds(ecnKminKB * 1000, (ecnKmaxKB ? ecnKmaxKB : 4 * ecnKminKB) * 1000, ecnPmax);
-    sw->SetLbMarking(lbMarking);
-    sw->SetLbThreshold(lbThresholdKB * 1000);
-    NS_ABORT_MSG_IF(lbMode != "step" && lbMode != "flow" && lbMode != "packet",
-                    "--lbMode must be step, flow or packet");
-    sw->SetLbMode(lbMode == "flow"     ? SwitchNode::LB_FLOW
-                  : lbMode == "packet" ? SwitchNode::LB_PACKET
-                                       : SwitchNode::LB_STEP);
     sw->SetTrimEnabled(trimEnabled);
     sw->SetEcnAtDequeue(ecnAtDequeue);
     return sw;
@@ -271,7 +272,7 @@ BuildMultiPlane()
             nic->SetDeviceType(PointToPointNetDevice::NetDeviceType::SERVER);
             nics[s][p] = nic;
             t0->AddRoute(RdmaSender::GetHostAddress(s), t0->GetNDevices() - 1);
-            t0->SetLbEnabled(t0->GetNDevices() - 1, false); // the last hop says nothing about the path
+            t0->SetEcnEnabled(t0->GetNDevices() - 1, lastHopEcn);
         }
 
         // T0 <-> T1 full mesh

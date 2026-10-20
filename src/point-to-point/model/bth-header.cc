@@ -95,7 +95,7 @@ BthHeader::Print(std::ostream& os) const
            << +m_seth.flags << std::dec << "]"
            << " CC_STATE[rcvd=" << m_ccState.rcvdBytes << " ts=" << m_ccState.echoTimestamp
            << " svc=" << m_ccState.serviceTime << " ecn=" << m_ccState.ecnMarkedPackets
-           << " bp=" << +m_ccState.hostBackpressure << " lb=" << +m_ccState.lbMarkedPackets << "]";
+           << " bp=" << +m_ccState.hostBackpressure << "]";
     }
     else if (m_opcode == MRC_NACK)
     {
@@ -218,7 +218,7 @@ BthHeader::Serialize(Buffer::Iterator start) const
         start.WriteHtonU32(m_ccState.serviceTime);
         start.WriteHtonU16(m_ccState.ecnMarkedPackets);
         start.WriteU8(m_ccState.hostBackpressure);
-        start.WriteU8(m_ccState.lbMarkedPackets);
+        start.WriteU8(m_ccState.reserved);
     }
     else if (m_opcode == MRC_NACK)
     {
@@ -306,7 +306,7 @@ BthHeader::Deserialize(Buffer::Iterator start)
         m_ccState.serviceTime = start.ReadNtohU32();
         m_ccState.ecnMarkedPackets = start.ReadNtohU16();
         m_ccState.hostBackpressure = start.ReadU8();
-        m_ccState.lbMarkedPackets = start.ReadU8();
+        m_ccState.reserved = start.ReadU8();
     }
     else if (m_opcode == MRC_NACK)
     {

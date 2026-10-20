@@ -180,8 +180,6 @@ RdmaReceiver::BuildSack(const Ipv6Header& dataIp,
     cc.rcvdBytes = m_rcvdBytes;
     cc.echoTimestamp = dataBth.GetTSH() ? dataBth.GetTseth().timestamp : 0;
     cc.ecnMarkedPackets = ce ? 1 : 0;
-    cc.lbMarkedPackets =
-        PointToPointQueue::HasEcnMark(dataIp, PointToPointQueue::ECN_MARK_LB) ? 1 : 0;
 
     BthHeader bth;
     bth.SetOpcode(BthHeader::MRC_SACK);

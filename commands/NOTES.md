@@ -118,6 +118,30 @@ IPv6, with **multiple planes**, driven by an **AI workload engine**.
   (Changed 2026-10-01. Spray runs are bit-identical to before the split, and
   so are SRv6 runs at the default, ECN off. SRv6 with `--ecnMark=1` now also
   marks ECN on the last hop.)
+  **Removed 2026-10-18:** the LB bit and every option above that belongs to it
+  (`--lbMark`, `--lbThreshold`, `--lbMode`, `--evOnLb`, `--ecnIgnoreOnLb`). Only
+  the ECN bit (0x02) is left. It drives congestion control and, with
+  `--srcRoute`, path switching too (`--evOnEcn`, default on). `--ecnMark` now
+  defaults to on for every mode, SRv6 included, and the ECN bit is set on every
+  port, the last hop (T0 → server) included. Run names lose the LB digit
+  (`_ECN1D` instead of `_ECN11D`).
+  **Changed 2026-10-18 (later):** the last hop (T0 → server) no longer marks
+  ECN (`--lastHopEcn=0` by default; `SwitchNode::SetEcnEnabled` per port), so
+  an ECN mark always points at a fabric path. Receiver-side incast is then seen
+  by congestion control through RTT (and trims) only.
+- **Load balancing (`--lb`, `RdmaSender::LoadBalancing`), added 2026-10-18:**
+  `mrc` is everything above (ECMP / spraying, or SRv6 active + backup EV
+  sets). `reps` is REPS (Bonato et al., "REPS: Recycled Entropy Packet
+  Spraying for Adaptive Load Balancing and Failure Mitigation", arXiv
+  2407.21625), per plane: a circular buffer (`RepsBufferSize`, 8) caches the EV
+  of every SACK without an ECN mark; each packet reuses the oldest valid EV
+  (then invalid), else a random EV (random flow label, or random path of the
+  plane with `--srcRoute`). A new or idle connection explores for
+  `RepsExplorePackets` (default one BDP per plane): every 8th packet random,
+  and random whenever nothing is cached. Trims and RTOs leave the buffer
+  alone. The paper's freezing mode (failure mitigation) was implemented and
+  then removed on 2026-10-18, since no failures are modeled. With `reps`, `--spray`, `EcmpEvSetSize`, `EvsPerPlane`,
+  `--evOnEcn` and `--evOnLoss` do not apply. Run names get `_REPS`.
 - **Trimming** (`--trim`): on buffer overflow, the packet becomes a fresh
   header-only packet sent at high priority.
 - **SRv6:** switch identity = (plane locator, switch uSID). A switch forwards
@@ -135,8 +159,17 @@ IPv6, with **multiple planes**, driven by an **AI workload engine**.
   - **Messages:** `PostMessage(msgId, size)` queues a message on one continuous
     PSN stream (RC order). The last packet is `WRITE_LAST/ONLY_WITH_IMM`, with
     ImmDt = message id.
-  - **Multi-plane:** each NIC calls `AddPlane()`. The window and MPR are shared,
-    and pacing is at the sum of the plane rates.
+  - **Multi-plane:** each NIC calls `AddPlane()`. Since 2026-10-19 every plane
+    runs its own NSCC (window, bytes in flight, RTT estimates, Quick Adapt) and
+    paces at its own rate; before, one window per QP was shared by all planes
+    and pacing was at the sum of the plane rates. A plane sends whenever its own
+    window allows, taking the next PSN of the shared stream, so a plane with
+    more capacity carries more of each message. A SACK returns on the data's
+    plane and drives that plane's controller; each packet's own SACK credits its
+    bytes once, and bytes acknowledged by another plane's bitmap only free the
+    window of the plane they were sent on. Trims and RTOs act on the plane of
+    the lost packets. PSNs, SACKs, the MPR and the RTO stay per QP. Results
+    before 2026-10-19 used the shared window.
   - **Reliability:**
     - selective: SACK bitmap plus the triggering PSN;
     - RACK-like loss detection: a packet is lost if a later-sent one was acked

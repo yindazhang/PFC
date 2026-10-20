@@ -4,6 +4,7 @@
 
 #include "ns3/boolean.h"
 #include "ns3/double.h"
+#include "ns3/enum.h"
 #include "ns3/hash.h"
 #include "ns3/ipv6-header.h"
 #include "ns3/log.h"
@@ -117,11 +118,10 @@ RdmaSender::GetTypeId()
                           UintegerValue(0),
                           MakeUintegerAccessor(&RdmaSender::m_ecmpEvSetSize),
                           MakeUintegerChecker<uint32_t>())
-            .AddAttribute("EvOnLb",
-                          "SourceRouting: a load-balancing mark on a SACK moves its EV to the "
-                          "backup queue",
+            .AddAttribute("EvOnEcn",
+                          "SourceRouting: an ECN mark on a SACK moves its EV to the backup queue",
                           BooleanValue(true),
-                          MakeBooleanAccessor(&RdmaSender::m_evOnLb),
+                          MakeBooleanAccessor(&RdmaSender::m_evOnEcn),
                           MakeBooleanChecker())
             .AddAttribute("EvOnLoss",
                           "SourceRouting: a trim NACK, or an RTO on the oldest outstanding "
@@ -129,16 +129,9 @@ RdmaSender::GetTypeId()
                           BooleanValue(true),
                           MakeBooleanAccessor(&RdmaSender::m_evOnLoss),
                           MakeBooleanChecker())
-            .AddAttribute("EcnIgnoreOnLb",
-                          "Congestion control ignores the ECN of a SACK whose packet also "
-                          "carried the load-balancing mark (path congestion: left to path "
-                          "switching)",
-                          BooleanValue(false),
-                          MakeBooleanAccessor(&RdmaSender::m_ecnIgnoreOnLb),
-                          MakeBooleanChecker())
             .AddAttribute("SourceRouting",
                           "MRC static SRv6 source routing with EV management: every EV maps "
-                          "to a path given by AddPath(); an LB mark, trim or RTO moves an EV to the backup queue",
+                          "to a path given by AddPath(); an ECN mark, trim or RTO moves an EV to the backup queue",
                           BooleanValue(false),
                           MakeBooleanAccessor(&RdmaSender::m_sourceRouting),
                           MakeBooleanChecker())
@@ -148,7 +141,24 @@ RdmaSender::GetTypeId()
                           "plane has: all of them",
                           UintegerValue(0),
                           MakeUintegerAccessor(&RdmaSender::m_evsPerPlane),
-                          MakeUintegerChecker<uint32_t>(1));
+                          MakeUintegerChecker<uint32_t>(1))
+            .AddAttribute("LoadBalancing",
+                          "How EVs (paths) are chosen: Mrc (ECMP / spraying, or SRv6 active "
+                          "and backup EV sets) or Reps (Recycled Entropy Packet Spraying)",
+                          EnumValue(LB_MRC),
+                          MakeEnumAccessor<LoadBalancing>(&RdmaSender::m_loadBalancing),
+                          MakeEnumChecker(LB_MRC, "Mrc", LB_REPS, "Reps"))
+            .AddAttribute("RepsBufferSize",
+                          "REPS: cached EVs per plane (circular buffer)",
+                          UintegerValue(8),
+                          MakeUintegerAccessor(&RdmaSender::m_repsBufferSize),
+                          MakeUintegerChecker<uint32_t>(1))
+            .AddAttribute("RepsExplorePackets",
+                          "REPS: packets per plane of the exploration phase (new or idle "
+                          "connection); 0: one BDP per plane",
+                          UintegerValue(0),
+                          MakeUintegerAccessor(&RdmaSender::m_repsExplorePackets),
+                          MakeUintegerChecker<uint32_t>());
     return tid;
 }
 
@@ -167,10 +177,12 @@ RdmaSender::RdmaSender(QpInfo qp)
       m_fairIncrease(0.5),
       m_fastIncrease(2),
       m_sourceRouting(false),
-      m_ecnIgnoreOnLb(false),
-      m_evOnLb(true),
+      m_evOnEcn(true),
       m_evOnLoss(true),
       m_evsPerPlane(0),
+      m_loadBalancing(LB_MRC),
+      m_repsBufferSize(8),
+      m_repsExplorePackets(0),
       m_evRng(qp.id),
       m_ecmpEvSetSize(0)
 {
@@ -227,6 +239,13 @@ RdmaSender::PostMessage(uint32_t msgId, uint32_t size)
     NS_ABORT_MSG_IF(uint64_t(m_postedPsn) + numPackets > UINT32_MAX,
                     "QP " << m_qp.id << ": PSN space exhausted");
     bool wasBlocked = !HasDataToSend();
+    if (IsIdle())
+    {
+        for (RepsState& reps : m_reps)
+        {
+            reps.explorePending = true; // REPS explores again after an idle period
+        }
+    }
     m_messages.push_back({msgId, size, m_nextMsn++, m_postedPsn, numPackets});
     m_postedPsn += numPackets;
     if (wasBlocked && HasDataToSend())
@@ -280,24 +299,23 @@ RdmaSender::AddPath(uint32_t plane, const Srv6Sid& path)
 uint32_t
 RdmaSender::AddPlane(DataRate rate, Callback<void> wakeup)
 {
-    if (m_planeWakeups.empty())
-    {
-        m_baseRtt = m_qp.minRttNs + m_rttSerializationBytes * 8 * 1e9 / rate.GetBitRate();
-    }
+    uint32_t plane = m_planeWakeups.size();
     m_planeWakeups.push_back(wakeup);
-    m_lineRate = m_lineRate + rate;
-    UpdateLimits();
-    if (m_minRttSample == INT64_MAX)
-    {
-        // Start at the line rate of every plane. Planes register one after
-        // another and the first may already have sent: keep resizing the
-        // initial window until congestion control has an RTT sample.
-        m_cwnd = m_bdp;
-        ClampCwnd();
-    }
 
-    uint32_t plane = m_planeWakeups.size() - 1;
-    if (m_sourceRouting)
+    // The plane's own controller, starting at its line rate
+    PlaneCc cc;
+    cc.rate = rate;
+    cc.baseRtt = m_qp.minRttNs + m_rttSerializationBytes * 8 * 1e9 / rate.GetBitRate();
+    UpdateLimits(cc);
+    cc.cwnd = cc.bdp;
+    ClampCwnd(cc);
+    m_cc.push_back(cc);
+
+    if (m_loadBalancing == LB_REPS)
+    {
+        InitReps(plane);
+    }
+    else if (m_sourceRouting)
     {
         BuildEvSet(plane);
     }
@@ -351,7 +369,7 @@ RdmaSender::SelectEv(uint32_t plane)
 void
 RdmaSender::OnEvSignal(int32_t ev)
 {
-    if (ev < 0 || uint32_t(ev) >= m_evs.size())
+    if (m_loadBalancing != LB_MRC || ev < 0 || uint32_t(ev) >= m_evs.size())
     {
         return;
     }
@@ -379,18 +397,110 @@ RdmaSender::OnEvSignal(int32_t ev)
 }
 
 void
-RdmaSender::UpdateLimits()
+RdmaSender::InitReps(uint32_t plane)
 {
-    m_targetRtt = m_targetRttFactor * m_baseRtt;
-    m_bdp = std::max<uint64_t>(m_mtu, m_lineRate.GetBitRate() / 8e9 * m_baseRtt);
-    m_maxCwnd = std::max<uint64_t>(m_mtu, m_maxCwndBdp * m_bdp);
-    ClampCwnd();
+    NS_ABORT_MSG_IF(m_sourceRouting &&
+                        (plane >= m_planePaths.size() || m_planePaths[plane].empty()),
+                    "QP " << m_qp.id << ": SourceRouting needs AddPath() for plane " << plane
+                            << " before AddPlane()");
+    m_reps.resize(plane + 1);
+    RepsState& reps = m_reps[plane];
+    reps.evs.assign(m_repsBufferSize, 0);
+    reps.valid.assign(m_repsBufferSize, false);
+}
+
+uint32_t
+RdmaSender::RepsRandomEv(uint32_t plane)
+{
+    s_stats.repsRandomEvs++;
+    if (m_sourceRouting)
+    {
+        const std::vector<uint32_t>& paths = m_planePaths[plane];
+        return paths[m_evRng() % paths.size()];
+    }
+    return m_evRng() & FLOW_LABEL_MASK;
+}
+
+int32_t
+RdmaSender::RepsNextEv(uint32_t plane)
+{
+    RepsState& reps = m_reps[plane];
+    uint32_t size = reps.evs.size();
+    if (reps.explorePending)
+    {
+        // New or idle connection: explore for about one BDP of this plane
+        reps.explorePending = false;
+        uint32_t bdpPackets = (m_cc[plane].bdp + m_mtu - 1) / m_mtu;
+        reps.exploreCounter = m_repsExplorePackets ? m_repsExplorePackets
+                                                   : std::max<uint32_t>(1, bdpPackets);
+    }
+
+    // Exploring: every size-th packet takes a random EV
+    if (reps.exploreCounter > 0)
+    {
+        reps.exploreCounter--;
+        if (reps.exploreCounter % size == 0)
+        {
+            s_stats.repsExploreEvs++;
+            return RepsRandomEv(plane);
+        }
+    }
+    if (reps.numValid == 0)
+    {
+        return RepsRandomEv(plane);
+    }
+
+    // The oldest valid EV, from the head (the oldest slot) on
+    s_stats.repsRecycledEvs++;
+    for (uint32_t i = 0; i < size; i++)
+    {
+        uint32_t slot = (reps.head + i) % size;
+        if (reps.valid[slot])
+        {
+            reps.valid[slot] = false;
+            reps.numValid--;
+            return reps.evs[slot];
+        }
+    }
+    NS_ABORT_MSG("REPS: numValid out of sync");
+    return -1;
 }
 
 void
-RdmaSender::ClampCwnd()
+RdmaSender::RepsOnAck(uint32_t plane, uint32_t ev, bool ecn)
 {
-    m_cwnd = std::clamp<uint32_t>(m_cwnd, m_mtu, std::max(m_mtu, m_maxCwnd));
+    if (plane >= m_reps.size() || ecn)
+    {
+        return; // ECN-marked: the EV is not worth recycling
+    }
+    RepsState& reps = m_reps[plane];
+    uint32_t size = reps.evs.size();
+    if (!reps.valid[reps.head])
+    {
+        reps.numValid++;
+    }
+    else
+    {
+        s_stats.repsOverwritten++;
+    }
+    reps.evs[reps.head] = ev;
+    reps.valid[reps.head] = true;
+    reps.head = (reps.head + 1) % size;
+}
+
+void
+RdmaSender::UpdateLimits(PlaneCc& cc)
+{
+    cc.targetRtt = m_targetRttFactor * cc.baseRtt;
+    cc.bdp = std::max<uint64_t>(m_mtu, cc.rate.GetBitRate() / 8e9 * cc.baseRtt);
+    cc.maxCwnd = std::max<uint64_t>(m_mtu, m_maxCwndBdp * cc.bdp);
+    ClampCwnd(cc);
+}
+
+void
+RdmaSender::ClampCwnd(PlaneCc& cc)
+{
+    cc.cwnd = std::clamp<uint32_t>(cc.cwnd, m_mtu, std::max(m_mtu, cc.maxCwnd));
 }
 
 bool
@@ -400,22 +510,35 @@ RdmaSender::CanSendNew() const
 }
 
 bool
-RdmaSender::IsWindowOpen() const
+RdmaSender::IsWindowOpen(uint32_t plane) const
 {
-    return m_inflightBytes == 0 || m_inflightBytes + m_mtu <= m_cwnd;
+    const PlaneCc& cc = m_cc[plane];
+    return cc.inflightBytes == 0 || cc.inflightBytes + m_mtu <= cc.cwnd;
 }
 
 bool
 RdmaSender::HasDataToSend() const
 {
-    return !m_planeWakeups.empty() && IsWindowOpen() && (!m_lost.empty() || CanSendNew());
+    if (m_lost.empty() && !CanSendNew())
+    {
+        return false;
+    }
+    for (uint32_t plane = 0; plane < m_cc.size(); plane++)
+    {
+        if (IsWindowOpen(plane))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool
 RdmaSender::HasPendingData(uint32_t plane) const
 {
-    return HasDataToSend() &&
-           (!m_sourceRouting || (plane < m_activeEvs.size() && !m_activeEvs[plane].empty()));
+    return (!m_lost.empty() || CanSendNew()) && IsWindowOpen(plane) &&
+           (!m_sourceRouting || m_loadBalancing == LB_REPS ||
+            (plane < m_activeEvs.size() && !m_activeEvs[plane].empty()));
 }
 
 int64_t
@@ -425,11 +548,12 @@ RdmaSender::GetNextSendTime(uint32_t plane) const
     {
         return -1; // blocked: the sender wakes the planes up when this changes
     }
-    if (m_lastSendTime < 0)
+    const PlaneCc& cc = m_cc[plane];
+    if (cc.lastSendTime < 0)
     {
         return 0;
     }
-    return m_lastSendTime + (uint64_t(m_mtu) * 8 * 1000000000ULL) / m_lineRate.GetBitRate();
+    return cc.lastSendTime + (uint64_t(m_mtu) * 8 * 1000000000ULL) / cc.rate.GetBitRate();
 }
 
 Ptr<Packet>
@@ -441,7 +565,9 @@ RdmaSender::GenerateNextPacket(uint32_t plane)
     {
         return nullptr;
     }
-    int32_t ev = m_sourceRouting ? SelectEv(plane) : -1;
+    int32_t ev = m_loadBalancing == LB_REPS ? RepsNextEv(plane)
+                 : m_sourceRouting             ? SelectEv(plane)
+                                               : -1;
 
     uint32_t psn;
     bool retransmission = !m_lost.empty();
@@ -464,8 +590,9 @@ RdmaSender::GenerateNextPacket(uint32_t plane)
     info.payload = std::min<uint64_t>(m_mtu, msg.size > offset ? msg.size - offset : 0);
     info.sendTime = now;
     info.ev = ev;
-    m_inflightBytes += info.payload;
-    m_lastSendTime = now;
+    info.plane = plane;
+    m_cc[plane].inflightBytes += info.payload;
+    m_cc[plane].lastSendTime = now;
 
     if (!m_rtoEvent.IsPending())
     {
@@ -533,15 +660,20 @@ RdmaSender::BuildPacket(const Message& msg, uint32_t psn, bool retransmission, i
     packet->AddHeader(udpHeader);
 
     uint8_t nextHeader = IPV6_NEXT_HEADER_UDP;
-    if (ev >= 0)
+    if (m_sourceRouting)
     {
         // Source routed: the EV names the path; the switches follow the SRH
+        NS_ASSERT_MSG(ev >= 0, "Source-routed packet without an EV");
         Srv6RoutingHeader srh;
         srh.SetNextHeader(IPV6_NEXT_HEADER_UDP);
         srh.SetPath({m_evs[ev].path});
         packet->AddHeader(srh);
         nextHeader = Srv6RoutingHeader::IPV6_NEXT_HEADER_ROUTING;
         m_entropy = ev;
+    }
+    else if (ev >= 0)
+    {
+        m_entropy = ev; // REPS: the flow label to hash on
     }
     else if (m_packetSpraying)
     {
@@ -566,7 +698,7 @@ RdmaSender::BuildPacket(const Message& msg, uint32_t psn, bool retransmission, i
 }
 
 void
-RdmaSender::Receive(Ptr<Packet> packet)
+RdmaSender::Receive(Ptr<Packet> packet, uint32_t plane)
 {
     Ipv6Header ipv6Header;
     BthHeader bth;
@@ -578,7 +710,7 @@ RdmaSender::Receive(Ptr<Packet> packet)
     switch (bth.GetOpcode())
     {
     case BthHeader::MRC_SACK:
-        ProcessSack(bth);
+        ProcessSack(bth, plane);
         break;
     case BthHeader::MRC_NACK:
         ProcessNack(bth);
@@ -602,7 +734,7 @@ RdmaSender::Acknowledge(uint32_t psn)
     switch (info.state)
     {
     case IN_FLIGHT:
-        m_inflightBytes -= info.payload;
+        m_cc[info.plane].inflightBytes -= info.payload;
         break;
     case LOST:
         // Acknowledged before its retransmission: the loss was spurious reordering
@@ -618,7 +750,7 @@ RdmaSender::Acknowledge(uint32_t psn)
 }
 
 void
-RdmaSender::ProcessSack(const BthHeader& bth)
+RdmaSender::ProcessSack(const BthHeader& bth, uint32_t plane)
 {
     const MrcSeth& seth = bth.GetSeth();
     const MrcCcState& cc = bth.GetCcState();
@@ -636,18 +768,38 @@ RdmaSender::ProcessSack(const BthHeader& bth)
     {
         rtt = now - Info(psn).sendTime - cc.serviceTime;
     }
+    // Congestion control of the plane the SACK came back on (the plane of the
+    // packet that triggered it): every packet's own SACK counts its bytes once,
+    // even when an earlier SACK's bitmap already acknowledged it
+    uint32_t ccBytes = m_mtu;
+    if (psn >= m_cumAck && psn < m_nextPsn && Info(psn).state != EMPTY)
+    {
+        ccBytes = Info(psn).payload;
+    }
     if (seth.flags & MrcSeth::FLAG_DUPLICATE)
     {
         WidenReorderWindow(); // the receiver already had it: a spurious retransmission
+        ccBytes = 0;
     }
-    bool ecn = bth.GetCNP() || cc.ecnMarkedPackets > 0; // congestion control only
-    if (m_ecnIgnoreOnLb && cc.lbMarkedPackets > 0)
+    bool ecn = bth.GetCNP() || cc.ecnMarkedPackets > 0;
+    if (m_sourceRouting && m_evOnEcn && cc.ecnMarkedPackets > 0)
     {
-        ecn = false; // the packet also carried the LB mark: path congestion, left to path switching
+        OnEvSignal(seth.reflectedEv); // ECN mark: this path is congested
     }
-    if (m_sourceRouting && m_evOnLb && cc.lbMarkedPackets > 0)
+    if (m_loadBalancing == LB_REPS)
     {
-        OnEvSignal(seth.reflectedEv); // load-balancing mark: this path is more congested
+        // The plane the reflected EV was sent on: the path's plane, or (ECMP)
+        // the plane of the packet if it carried that EV
+        uint32_t ev = seth.reflectedEv;
+        if (m_sourceRouting && ev < m_evs.size())
+        {
+            RepsOnAck(m_evs[ev].plane, ev, cc.ecnMarkedPackets > 0);
+        }
+        else if (!m_sourceRouting && psn >= m_cumAck && psn < m_nextPsn &&
+                 Info(psn).state != EMPTY && Info(psn).ev == int32_t(ev))
+        {
+            RepsOnAck(Info(psn).plane, ev, cc.ecnMarkedPackets > 0);
+        }
     }
 
     uint32_t ackedBytes = 0;
@@ -691,7 +843,10 @@ RdmaSender::ProcessSack(const BthHeader& bth)
         DetectReorderLoss();
         m_rto = m_minRto;
         RestartRto(); // stops the timer once nothing is outstanding
-        OnAck(ackedBytes, ecn, rtt);
+    }
+    if (ccBytes > 0 && plane < m_cc.size())
+    {
+        OnAck(m_cc[plane], ccBytes, ecn, rtt);
     }
     if (advanced)
     {
@@ -728,16 +883,18 @@ RdmaSender::ProcessNack(const BthHeader& bth)
     {
         OnEvSignal(Info(neth.psn).ev);
     }
+    PlaneCc& cc = m_cc[Info(neth.psn).plane];
     MarkLost(neth.psn);
 
-    // A trim is a congestion signal: shrink the window and adapt on the next period
+    // A trim is a congestion signal for the plane it was sent on: shrink its
+    // window and adapt on the next period
     s_stats.trimNacks += neth.code == MrcNeth::NACK_TRIMMED;
-    if (neth.code == MrcNeth::NACK_TRIMMED && m_bytesIgnored >= m_bytesToIgnore)
+    if (neth.code == MrcNeth::NACK_TRIMMED && cc.bytesIgnored >= cc.bytesToIgnore)
     {
         uint32_t payload = Info(neth.psn).payload;
-        m_cwnd = m_cwnd > payload ? m_cwnd - payload : 0;
-        ClampCwnd();
-        TriggerQuickAdapt();
+        cc.cwnd = cc.cwnd > payload ? cc.cwnd - payload : 0;
+        ClampCwnd(cc);
+        cc.qaTriggered = true;
     }
 }
 
@@ -750,7 +907,7 @@ RdmaSender::MarkLost(uint32_t psn)
         return;
     }
     info.state = LOST;
-    m_inflightBytes -= info.payload;
+    m_cc[info.plane].inflightBytes -= info.payload;
     m_lost.insert(psn);
 }
 
@@ -765,8 +922,6 @@ void
 RdmaSender::DetectReorderLoss()
 {
     int64_t now = Simulator::Now().GetNanoSeconds();
-    double rtt = m_avgRtt > 0 ? m_avgRtt : m_baseRtt;
-    double deadline = rtt + m_reorderWindowRtts * m_baseRtt;
     for (uint32_t psn = m_cumAck; psn < m_nextPsn; psn++)
     {
         PacketInfo& info = Info(psn);
@@ -774,6 +929,10 @@ RdmaSender::DetectReorderLoss()
         {
             continue;
         }
+        // RTT of the plane it was sent on
+        const PlaneCc& cc = m_cc[info.plane];
+        double rtt = cc.avgRtt > 0 ? cc.avgRtt : cc.baseRtt;
+        double deadline = rtt + m_reorderWindowRtts * cc.baseRtt;
         if (info.sendTime >= m_rackXmitTime)
         {
             if (!info.retransmitted)
@@ -786,7 +945,7 @@ RdmaSender::DetectReorderLoss()
         if (now - info.sendTime > deadline)
         {
             // No EV change: with spraying this is mostly reordering, not a failed
-            // path (the LB mark and trims already steer away from congestion)
+            // path (ECN and trims already steer away from congestion)
             s_stats.reorderLosses++;
             MarkLost(psn);
         }
@@ -794,73 +953,73 @@ RdmaSender::DetectReorderLoss()
 }
 
 void
-RdmaSender::OnAck(uint32_t ackedBytes, bool ecn, int64_t rtt)
+RdmaSender::OnAck(PlaneCc& cc, uint32_t ackedBytes, bool ecn, int64_t rtt)
 {
-    m_qaAcked += ackedBytes;
-    QuickAdapt();
-    if (m_bytesIgnored < m_bytesToIgnore)
+    cc.qaAcked += ackedBytes;
+    QuickAdapt(cc);
+    if (cc.bytesIgnored < cc.bytesToIgnore)
     {
         // Signals of packets sent before Quick Adapt resized the window
-        m_bytesIgnored += ackedBytes;
+        cc.bytesIgnored += ackedBytes;
         return;
     }
 
     if (rtt >= 0)
     {
-        m_avgRtt = m_avgRtt == 0 ? rtt : m_avgRtt + RTT_EWMA_GAIN * (rtt - m_avgRtt);
-        if (rtt < m_minRttSample)
+        cc.avgRtt = cc.avgRtt == 0 ? rtt : cc.avgRtt + RTT_EWMA_GAIN * (rtt - cc.avgRtt);
+        if (rtt < cc.minRttSample)
         {
             // Best guess of the unloaded RTT: the minimum sample, which replaces
             // the configured estimate (propagation + fixed serialization)
-            m_minRttSample = rtt;
-            m_baseRtt = rtt;
-            UpdateLimits();
+            cc.minRttSample = rtt;
+            cc.baseRtt = rtt;
+            UpdateLimits(cc);
         }
     }
     else
     {
-        rtt = m_avgRtt > 0 ? m_avgRtt : m_baseRtt;
+        rtt = cc.avgRtt > 0 ? cc.avgRtt : cc.baseRtt;
     }
 
-    double cwnd = m_cwnd;
+    double cwnd = cc.cwnd;
     double mtu = m_mtu;
 
     // Fast Increase: a whole window went uncongested at (about) base RTT
-    if (!ecn && rtt <= m_baseRtt + FAST_INCREASE_SLACK * (m_targetRtt - m_baseRtt))
+    if (!ecn && rtt <= cc.baseRtt + FAST_INCREASE_SLACK * (cc.targetRtt - cc.baseRtt))
     {
-        m_fastIncreaseCount += ackedBytes;
-        if (m_fastIncreaseActive || m_fastIncreaseCount > m_cwnd)
+        cc.fastIncreaseCount += ackedBytes;
+        if (cc.fastIncreaseActive || cc.fastIncreaseCount > cc.cwnd)
         {
-            m_fastIncreaseActive = true;
-            m_cwnd = std::min<double>(UINT32_MAX, cwnd + m_fastIncrease * mtu);
-            ClampCwnd();
+            cc.fastIncreaseActive = true;
+            cc.cwnd = std::min<double>(UINT32_MAX, cwnd + m_fastIncrease * mtu);
+            ClampCwnd(cc);
             return;
         }
     }
     else
     {
-        m_fastIncreaseCount = 0;
-        m_fastIncreaseActive = false;
+        cc.fastIncreaseCount = 0;
+        cc.fastIncreaseActive = false;
     }
 
     int64_t now = Simulator::Now().GetNanoSeconds();
-    double fair = ackedBytes / cwnd * m_bdp * m_fairIncrease;
-    if (ecn && rtt > m_targetRtt)
+    double fair = ackedBytes / cwnd * cc.bdp * m_fairIncrease;
+    if (ecn && rtt > cc.targetRtt)
     {
         // Congested: multiplicative decrease, at most once per base RTT
-        if (m_lastDecreaseTime < 0 || now - m_lastDecreaseTime >= m_baseRtt)
+        if (cc.lastDecreaseTime < 0 || now - cc.lastDecreaseTime >= cc.baseRtt)
         {
-            double avg = std::max<double>(m_avgRtt, rtt);
-            double factor = std::max(MD_MIN_FACTOR, 1 - (avg - m_targetRtt) / avg * MD_GAIN);
+            double avg = std::max<double>(cc.avgRtt, rtt);
+            double factor = std::max(MD_MIN_FACTOR, 1 - (avg - cc.targetRtt) / avg * MD_GAIN);
             cwnd *= std::min(1.0, factor);
-            m_lastDecreaseTime = now;
+            cc.lastDecreaseTime = now;
         }
     }
     else if (ecn)
     {
         // Congestion building up at a switch: leave it to load balancing
     }
-    else if (rtt > m_targetRtt)
+    else if (rtt > cc.targetRtt)
     {
         cwnd += fair; // congestion going down
     }
@@ -868,41 +1027,35 @@ RdmaSender::OnAck(uint32_t ackedBytes, bool ecn, int64_t rtt)
     {
         // Underloaded: proportional increase towards the target RTT, at most
         // the acknowledged bytes (doubling per RTT), plus fair increase
-        double pi = double(m_baseRtt) / (m_targetRtt - m_baseRtt);
-        double proportional = (m_targetRtt - rtt) / double(std::max<int64_t>(rtt, 1)) * mtu * pi;
+        double pi = double(cc.baseRtt) / (cc.targetRtt - cc.baseRtt);
+        double proportional = (cc.targetRtt - rtt) / double(std::max<int64_t>(rtt, 1)) * mtu * pi;
         cwnd += std::min<double>(ackedBytes, proportional) + fair;
     }
-    m_cwnd = std::min<double>(UINT32_MAX, cwnd);
-    ClampCwnd();
+    cc.cwnd = std::min<double>(UINT32_MAX, cwnd);
+    ClampCwnd(cc);
 }
 
 void
-RdmaSender::TriggerQuickAdapt()
-{
-    m_qaTriggered = true;
-}
-
-void
-RdmaSender::QuickAdapt()
+RdmaSender::QuickAdapt(PlaneCc& cc)
 {
     int64_t now = Simulator::Now().GetNanoSeconds();
-    if (now < m_qaEnd)
+    if (now < cc.qaEnd)
     {
         return;
     }
-    if (m_qaTriggered && m_qaEnd != 0)
+    if (cc.qaTriggered && cc.qaEnd != 0)
     {
         // Rate the network actually delivered over the last target RTT
-        m_qaTriggered = false;
-        m_cwnd = std::min<uint64_t>(UINT32_MAX, m_qaAcked);
-        ClampCwnd();
-        m_bytesToIgnore = m_inflightBytes;
-        m_bytesIgnored = 0;
-        m_fastIncreaseCount = 0;
-        m_fastIncreaseActive = false;
+        cc.qaTriggered = false;
+        cc.cwnd = std::min<uint64_t>(UINT32_MAX, cc.qaAcked);
+        ClampCwnd(cc);
+        cc.bytesToIgnore = cc.inflightBytes;
+        cc.bytesIgnored = 0;
+        cc.fastIncreaseCount = 0;
+        cc.fastIncreaseActive = false;
     }
-    m_qaEnd = now + m_targetRtt;
-    m_qaAcked = 0;
+    cc.qaEnd = now + cc.targetRtt;
+    cc.qaAcked = 0;
 }
 
 void
@@ -927,6 +1080,7 @@ RdmaSender::OnRto()
     {
         if (Info(psn).state == IN_FLIGHT)
         {
+            m_cc[Info(psn).plane].qaTriggered = true; // Quick Adapt on every plane that lost packets
             MarkLost(psn);
             anyLost = true;
         }
@@ -944,7 +1098,6 @@ RdmaSender::OnRto()
     {
         m_entropy = NextEntropy(); // move the flow to another path
     }
-    TriggerQuickAdapt();
     NotifyPlanes();
 }
 

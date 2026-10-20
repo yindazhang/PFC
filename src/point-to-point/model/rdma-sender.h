@@ -40,16 +40,23 @@ struct QpInfo
  * the next; the sender idles (no packets, no timer) while nothing is posted.
  *
  * Multi-plane: each plane (NetDevice) registers with AddPlane() and pulls
- * packets with GenerateNextPacket() whenever it can transmit. The congestion
- * window, pacing (at the sum of the plane rates) and the MPR are shared by
- * all planes.
+ * packets with GenerateNextPacket() whenever it can transmit. Every plane
+ * runs its own congestion controller (window, bytes in flight, RTT
+ * estimates, Quick Adapt) and paces at its own rate; a plane sends whenever
+ * its own window allows, taking the next PSN of the shared stream, so a
+ * plane with more capacity carries more of each message. Reliability (PSNs,
+ * SACKs, MPR, retransmission, RTO) is per connection.
  *
  * Every packet is IPv6 / UDP(4791) / BTH (MRC_WRITE_*) + METH [+ TSETH] + RETH
  * + payload, carries its byte offset in RETH (out-of-order placement) and an
  * entropy value (EV) in the IPv6 flow label, echoed back in SACKs.
  *
- * Path selection:
- *   - Default: hash-based ECMP. With PacketSpraying, a fresh EV per packet.
+ * Path selection: the EVs are flow labels hashed by ECMP switches, or with
+ * SourceRouting indices of SRv6 paths given with AddPath(). The LoadBalancing
+ * attribute picks how EVs are chosen:
+ *
+ * LoadBalancing = Mrc (default):
+ *   - Hash-based ECMP. With PacketSpraying, a fresh EV per packet.
  *   - SourceRouting (MRC with static SRv6): every EV maps to one SRv6 path
  *     given with AddPath() (plane + switches). At startup the sender picks
  *     EvsPerPlane random paths per plane as the active EV set; the rest form
@@ -57,9 +64,8 @@ struct QpInfo
  *     paths (rounded up; less if EvsPerPlane is smaller), even when all
  *     paths start active. Each plane sprays over all of its active EVs in
  *     turn. Without EV probes there is no skip / bad state:
- *       * a load-balancing mark on a SACK (PointToPointQueue::ECN_MARK_LB,
- *         not ECN: ECN only drives congestion control), a trim NACK, or an
- *         RTO on the oldest outstanding packet, for an active EV: that EV leaves the active set
+ *       * an ECN mark on a SACK, a trim NACK, or an RTO on the oldest
+ *         outstanding packet, for an active EV: that EV leaves the active set
  *         and goes to the back of its plane's backup queue;
  *       * whenever a plane has fewer active EVs than its target, the front
  *         of its backup queue rejoins the active set. So with all paths
@@ -68,8 +74,25 @@ struct QpInfo
  *       * signals for an EV that is already a backup are ignored;
  *       * reorder-detected losses and duplicate SACKs do not change EVs:
  *         under spraying they are reordering, not failed paths.
- *     Each trigger can be turned off: EvOnLb (the LB mark) and EvOnLoss (trim
- *     NACK and RTO). ECN never moves paths.
+ *     Each trigger can be turned off: EvOnEcn (the ECN mark, which also
+ *     drives congestion control) and EvOnLoss (trim NACK and RTO).
+ *
+ * LoadBalancing = Reps (REPS, Recycled Entropy Packet Spraying, Bonato et
+ * al., arXiv 2407.21625), per packet on every plane, with hash-based ECMP or
+ * SourceRouting alike (PacketSpraying, EcmpEvSetSize, EvsPerPlane, EvOnEcn and
+ * EvOnLoss do not apply). Each plane keeps a circular buffer of RepsBufferSize
+ * EVs:
+ *   - a SACK without an ECN mark caches the EV it reflects at the buffer head
+ *     as valid (overwriting the oldest entry); an ECN-marked SACK discards it;
+ *   - each packet reuses the oldest valid EV and invalidates it, so good EVs
+ *     are recycled at the rate they are acknowledged; with none valid (or an
+ *     empty buffer) it takes a random EV (random flow label / random path of
+ *     the plane);
+ *   - exploration: for RepsExplorePackets packets (default one BDP per plane)
+ *     of a new or idle connection, every RepsBufferSize-th packet takes a
+ *     random EV;
+ *   - trim NACKs and RTOs do not change the buffer. The paper's freezing
+ *     mode (failure mitigation) is not implemented: no failures are modeled.
  *
  * Reliability: selective. SACKs advance the cumulative ack and mark
  * out-of-order arrivals; NACKs (trimmed / out of MPR) and time-based reorder
@@ -81,8 +104,10 @@ struct QpInfo
  * earliest PSN first, with the BTH rtx bit set.
  *
  * Congestion control: NSCC (UEC, based on SMaRTT), window-based and SACK-
- * clocked, one window per connection across all paths. On each SACK, with
- * the ECN signal and an RTT sample:
+ * clocked, one window per plane across the paths of that plane. A SACK comes
+ * back on the plane of the packet that triggered it and drives that plane's
+ * controller (bytes acknowledged by its bitmap free the window of the plane
+ * they were sent on). On each SACK, with the ECN signal and an RTT sample:
  *   - ECN, RTT > target:      multiplicative decrease, at most once per base RTT
  *   - ECN, RTT <= target:     no change (congestion only building up)
  *   - no ECN, RTT > target:   fair increase
@@ -132,8 +157,8 @@ public:
      */
     Ptr<Packet> GenerateNextPacket(uint32_t plane);
 
-    /** Process a SACK/NACK (starting with its IPv6 header). */
-    void Receive(Ptr<Packet> packet);
+    /** Process a SACK/NACK (starting with its IPv6 header) received on \p plane. */
+    void Receive(Ptr<Packet> packet, uint32_t plane);
 
     /** True while \p plane may send: new or lost data, an open window, an active EV. */
     bool HasPendingData(uint32_t plane) const;
@@ -142,7 +167,14 @@ public:
     /** True while every posted byte is acknowledged. */
     bool IsIdle() const { return m_cumAck == m_postedPsn; }
 
-    uint32_t GetCwnd() const { return m_cwnd; }
+    uint32_t GetCwnd(uint32_t plane) const { return m_cc.at(plane).cwnd; }
+
+    /** How the sender picks the EV (path) of each packet. */
+    enum LoadBalancing
+    {
+        LB_MRC,  //!< MRC: ECMP / spraying, or SRv6 active and backup EV sets
+        LB_REPS, //!< REPS: recycle the EVs of unmarked SACKs
+    };
 
     /** Totals over every sender of the simulation. */
     struct GlobalStats
@@ -156,6 +188,10 @@ public:
         uint64_t trimNacks{0};
         uint64_t evSwaps{0};         //!< Active EVs moved to the backup queue (ECN / trim / RTO)
         uint64_t evRejoins{0};       //!< Backup EVs moved back into the active set
+        uint64_t repsRandomEvs{0};   //!< REPS: packets sent on a random EV
+        uint64_t repsExploreEvs{0};  //!< REPS: of which by the exploration rule
+        uint64_t repsOverwritten{0}; //!< REPS: valid EVs overwritten before being reused
+        uint64_t repsRecycledEvs{0}; //!< REPS: packets sent on a cached EV
     };
 
     static const GlobalStats& GetGlobalStats() { return s_stats; }
@@ -179,7 +215,8 @@ private:
         bool retransmitted{false}; //!< No RTT sample; excluded from reorder loss detection
         uint32_t payload{0};       //!< Payload bytes
         int64_t sendTime{0};       //!< ns
-        int32_t ev{-1};            //!< EV used (SourceRouting), -1 otherwise
+        int32_t ev{-1};            //!< EV used (SourceRouting, or REPS), -1 otherwise
+        uint32_t plane{0};         //!< Plane it was sent on
     };
 
     /** A posted message: PSNs [firstPsn, firstPsn + numPackets). */
@@ -198,20 +235,32 @@ private:
         Srv6Sid path;
     };
 
+    /** REPS state of one plane. */
+    struct RepsState
+    {
+        std::vector<uint32_t> evs;   //!< Circular buffer of cached EVs
+        std::vector<bool> valid;     //!< Not reused since it was cached
+        uint32_t head{0};            //!< Next slot to write (the oldest entry)
+        uint32_t numValid{0};
+        uint32_t exploreCounter{0};  //!< Packets left in the exploration phase
+        bool explorePending{true};   //!< Start exploring on the next packet (new / idle)
+    };
+
     PacketInfo& Info(uint32_t psn) { return m_window[psn % m_window.size()]; }
     /** Grow the ring (up to the MPR) until every PSN in [m_cumAck, m_nextPsn) has a slot. */
     void GrowWindow();
     /** The unacknowledged message \p psn belongs to. */
     const Message& MessageOf(uint32_t psn) const;
     bool CanSendNew() const;
-    bool IsWindowOpen() const;
+    bool IsWindowOpen(uint32_t plane) const;
+    /** New or lost data, and some plane's window open. */
     bool HasDataToSend() const;
 
     Ptr<Packet> BuildPacket(const Message& msg, uint32_t psn, bool retransmission, int32_t ev);
     uint32_t NextEntropy();
 
     // Reliability
-    void ProcessSack(const BthHeader& bth);
+    void ProcessSack(const BthHeader& bth, uint32_t plane);
     void ProcessNack(const BthHeader& bth);
     /** Mark \p psn acknowledged; returns its payload bytes if it was not already. */
     uint32_t Acknowledge(uint32_t psn);
@@ -234,12 +283,46 @@ private:
      */
     void OnEvSignal(int32_t ev);
 
-    // NSCC
-    void UpdateLimits();
-    void OnAck(uint32_t ackedBytes, bool ecn, int64_t rtt);
-    void QuickAdapt();
-    void TriggerQuickAdapt();
-    void ClampCwnd();
+    // REPS
+    void InitReps(uint32_t plane);
+    /** EV of the next packet on \p plane. */
+    int32_t RepsNextEv(uint32_t plane);
+    /** A random EV on \p plane: a flow label, or a path of the plane (SourceRouting). */
+    uint32_t RepsRandomEv(uint32_t plane);
+    /** SACK of a packet sent with \p ev on \p plane. */
+    void RepsOnAck(uint32_t plane, uint32_t ev, bool ecn);
+
+    /** NSCC state of one plane. */
+    struct PlaneCc
+    {
+        DataRate rate;
+        uint64_t inflightBytes{0};
+        int64_t lastSendTime{-1}; //!< For pacing at rate
+
+        int64_t baseRtt{0};   //!< ns: configured estimate, then the minimum RTT sample
+        int64_t minRttSample{INT64_MAX};
+        int64_t targetRtt{0}; //!< ns
+        double avgRtt{0};     //!< ns, EWMA
+        uint32_t bdp{0};      //!< rate * base RTT, bytes
+        uint32_t maxCwnd{0};
+        uint32_t cwnd{0};
+        int64_t lastDecreaseTime{-1};
+
+        uint32_t fastIncreaseCount{0}; //!< Uncongested bytes in a row
+        bool fastIncreaseActive{false};
+
+        uint64_t qaAcked{0}; //!< Bytes acked in the current Quick Adapt period
+        int64_t qaEnd{0};    //!< End of the current Quick Adapt period (ns)
+        bool qaTriggered{false};
+        uint64_t bytesToIgnore{0};
+        uint64_t bytesIgnored{0};
+    };
+
+    // NSCC, per plane
+    void UpdateLimits(PlaneCc& cc);
+    void OnAck(PlaneCc& cc, uint32_t ackedBytes, bool ecn, int64_t rtt);
+    void QuickAdapt(PlaneCc& cc);
+    void ClampCwnd(PlaneCc& cc);
 
     // QP
     QpInfo m_qp;
@@ -260,15 +343,17 @@ private:
     double m_fairIncrease;    //!< BDP fraction added per window of acked bytes (fi)
     uint32_t m_fastIncrease;  //!< MTUs added per ack during Fast Increase (k)
     bool m_sourceRouting;     //!< SRv6 source routing + EV management
-    bool m_ecnIgnoreOnLb;     //!< Congestion control ignores ECN when the LB mark is also set
-    bool m_evOnLb;            //!< Path switching on the LB mark
+    bool m_evOnEcn;           //!< Path switching on an ECN mark
     bool m_evOnLoss;          //!< Path switching on a trim NACK or an RTO
     uint32_t m_evsPerPlane;   //!< Active EVs per plane (0: half of its paths)
+    LoadBalancing m_loadBalancing;
+    uint32_t m_repsBufferSize;
+    uint32_t m_repsExplorePackets; //!< 0: one BDP per plane
 
     uint32_t m_mtu{0};
 
     // Planes
-    DataRate m_lineRate; //!< Sum of the plane rates
+    std::vector<PlaneCc> m_cc; //!< [plane]
     std::vector<Callback<void>> m_planeWakeups;
 
     // EV management (SourceRouting): EV value = index in m_evs
@@ -281,6 +366,7 @@ private:
     std::mt19937 m_evRng;
     std::vector<uint32_t> m_ecmpEvs; //!< Hash-based EV set (EcmpEvSetSize > 0), rotated
     uint32_t m_ecmpEvSetSize;
+    std::vector<RepsState> m_reps; //!< [plane] (LB_REPS)
     static GlobalStats s_stats;
 
     // Messages
@@ -294,7 +380,6 @@ private:
     uint32_t m_cumAck{0};  //!< Every PSN below it is acknowledged
     std::vector<PacketInfo> m_window; //!< Ring over [m_cumAck, m_nextPsn), grown up to the MPR
     std::set<uint32_t> m_lost;        //!< PSNs to retransmit, earliest first
-    uint64_t m_inflightBytes{0};
     int64_t m_rackXmitTime{-1}; //!< Latest send time of an acknowledged packet (ns)
     double m_reorderWindowRtts{8.0}; //!< Current reorder window, in base RTTs
 
@@ -303,26 +388,6 @@ private:
 
     uint32_t m_entropy{0};
     uint64_t m_packetCount{0};
-    int64_t m_lastSendTime{-1}; //!< For pacing at m_lineRate
-
-    // NSCC state
-    int64_t m_baseRtt{0};   //!< ns: configured estimate, then the minimum RTT sample
-    int64_t m_minRttSample{INT64_MAX};
-    int64_t m_targetRtt{0}; //!< ns
-    double m_avgRtt{0};     //!< ns, EWMA
-    uint32_t m_bdp{0};      //!< line rate * base RTT, bytes
-    uint32_t m_maxCwnd{0};
-    uint32_t m_cwnd{0};
-    int64_t m_lastDecreaseTime{-1};
-
-    uint32_t m_fastIncreaseCount{0}; //!< Uncongested bytes in a row
-    bool m_fastIncreaseActive{false};
-
-    uint64_t m_qaAcked{0}; //!< Bytes acked in the current Quick Adapt period
-    int64_t m_qaEnd{0};    //!< End of the current Quick Adapt period (ns)
-    bool m_qaTriggered{false};
-    uint64_t m_bytesToIgnore{0};
-    uint64_t m_bytesIgnored{0};
 };
 
 } // namespace ns3
