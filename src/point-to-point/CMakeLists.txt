@@ -30,6 +30,7 @@ build_lib(
     model/bth-header.cc
     model/srv6-header.cc
     model/pfc-header.cc
+    model/int-header.cc
     model/packet-tag.cc
   HEADER_FILES
     ${mpi_headers}
@@ -44,6 +45,7 @@ build_lib(
     model/bth-header.h
     model/srv6-header.h
     model/pfc-header.h
+    model/int-header.h
     model/packet-tag.h
   LIBRARIES_TO_LINK ${libnetwork}
                     ${mpi_libraries}

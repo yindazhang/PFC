@@ -9,6 +9,7 @@
 #include "ns3/udp-header.h"
 
 #include "bth-header.h"
+#include "int-header.h"
 #include "packet-tag.h"
 #include "pfc-header.h"
 #include "point-to-point-channel.h"
@@ -120,13 +121,42 @@ SwitchNode::SetEcmpSeed(uint32_t seed)
     m_ecmpSeed = seed;
 }
 
-uint64_t
-SwitchNode::GetTxBytes(uint32_t ifIndex) const
+const SwitchNode::PortState*
+SwitchNode::GetPort(uint32_t ifIndex) const
 {
     Ptr<PointToPointNetDevice> dev = DynamicCast<PointToPointNetDevice>(GetDevice(ifIndex));
     auto it = m_ports.find(dev);
-    return it == m_ports.end() ? 0 : it->second.txBytes;
+    return it == m_ports.end() ? nullptr : &it->second;
 }
+
+uint64_t
+SwitchNode::GetRxBytesLp(uint32_t ifIndex) const
+{
+    const PortState* port = GetPort(ifIndex);
+    return port == nullptr ? 0 : port->rxBytesLp;
+}
+
+uint64_t
+SwitchNode::GetRxBytesHp(uint32_t ifIndex) const
+{
+    const PortState* port = GetPort(ifIndex);
+    return port == nullptr ? 0 : port->rxBytesHp;
+}
+
+uint64_t
+SwitchNode::GetTxBytesLp(uint32_t ifIndex) const
+{
+    const PortState* port = GetPort(ifIndex);
+    return port == nullptr ? 0 : port->txBytesLp;
+}
+
+uint64_t
+SwitchNode::GetTxBytesHp(uint32_t ifIndex) const
+{
+    const PortState* port = GetPort(ifIndex);
+    return port == nullptr ? 0 : port->txBytesHp;
+}
+
 
 void
 SwitchNode::SetEcnAtDequeue(bool atDequeue)
@@ -178,6 +208,45 @@ SwitchNode::SetTrimEnabled(bool enabled)
 }
 
 void
+SwitchNode::SetIntVersion(uint8_t version)
+{
+    NS_ABORT_MSG_IF(version > IntHeader::VERSION_MAX, "Unsupported INT version " << +version);
+    m_intVersion = version;
+}
+
+void
+SwitchNode::SetIntMonitor(const std::vector<uint32_t>& ports,
+                          const std::vector<double>& levels,
+                          double hysteresis)
+{
+    NS_ABORT_MSG_IF(levels.empty() || levels.size() > 9, "Telemetry needs 1 to 9 levels");
+    NS_ABORT_MSG_IF(hysteresis <= 0 || hysteresis >= levels[0],
+                    "Telemetry needs 0 < hysteresis < the lowest level");
+    for (uint32_t i = 1; i < levels.size(); i++)
+    {
+        NS_ABORT_MSG_IF(levels[i] <= levels[i - 1], "Telemetry levels must increase");
+    }
+    m_monitorPorts.clear();
+    for (uint32_t ifIndex : ports)
+    {
+        Ptr<PointToPointNetDevice> dev = DynamicCast<PointToPointNetDevice>(GetDevice(ifIndex));
+        NS_ABORT_MSG_IF(dev == nullptr, "SetIntMonitor: device " << ifIndex << " is not point-to-point");
+        PortState& port = m_ports.at(dev);
+        port.monitorIndex = m_monitorPorts.size();
+        port.levelUp.clear();
+        port.levelDown.clear();
+        for (double level : levels)
+        {
+            port.levelUp.push_back(level * port.portBuffer);
+            port.levelDown.push_back((level - hysteresis) * port.portBuffer);
+        }
+        port.level[MONITOR_OUT] = 0;
+        port.level[MONITOR_IN] = 0;
+        m_monitorPorts.push_back(dev);
+    }
+}
+
+void
 SwitchNode::SetSwitchId(uint32_t plane, uint16_t switchId)
 {
     m_plane = plane;
@@ -214,8 +283,25 @@ SwitchNode::IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPo
 
     Ipv6Header ipv6Header;
     packet->RemoveHeader(ipv6Header);
+
+    // INT (added by the previous switch): strip it, restoring the header chain
+    IntHeader intHeader;
+    bool hasInt = ipv6Header.GetNextHeader() == IntHeader::IPV6_NEXT_HEADER_INT;
+    if (hasInt)
+    {
+        packet->RemoveHeader(intHeader);
+        ipv6Header.SetNextHeader(intHeader.GetNextHeader());
+        ipv6Header.SetPayloadLength(ipv6Header.GetPayloadLength() - IntHeader::SIZE);
+        size -= IntHeader::SIZE;
+    }
+
     bool lowPriority =
         PointToPointQueue::GetPriority(ipv6Header) == PointToPointQueue::PRIORITY_LOW;
+    (lowPriority ? in.rxBytesLp : in.rxBytesHp) += size;
+    if (hasInt && in.monitorIndex >= 0 && intHeader.GetVersion() == IntHeader::VERSION_QUEUE_LENGTH)
+    {
+        OnMonitorSample(in, MONITOR_IN, intHeader.GetQueueLength());
+    }
 
     // Routing (extension headers and payload are left untouched)
     uint8_t hopLimit = ipv6Header.GetHopLimit();
@@ -359,10 +445,23 @@ SwitchNode::IngressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPo
 Ptr<Packet>
 SwitchNode::EgressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPointNetDevice> outPort)
 {
-    // Only low-priority packets hold MMU buffer
-    if (protocol != PROTOCOL_IPV6 ||
-        PointToPointQueue::GetPriority(packet) != PointToPointQueue::PRIORITY_LOW)
+    if (protocol != PROTOCOL_IPV6)
     {
+        return packet; // PFC: not counted
+    }
+    // Only low-priority packets hold MMU buffer
+    if (PointToPointQueue::GetPriority(packet) != PointToPointQueue::PRIORITY_LOW)
+    {
+        PortState& out = m_ports.at(outPort);
+        out.txBytesHp += packet->GetSize() - PppHeader().GetSerializedSize();
+        if (m_intVersion != 0)
+        {
+            AddInt(packet, out);
+        }
+        if (out.monitorIndex >= 0)
+        {
+            OnMonitorSample(out, MONITOR_OUT, out.egressUsed); // a sample of the LP queue
+        }
         return packet;
     }
 
@@ -381,7 +480,7 @@ SwitchNode::EgressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPoi
 
     int32_t egressSharedBefore = GetEgressSharedUsed(out);
     out.egressUsed -= size;
-    out.txBytes += size;
+    out.txBytesLp += size;
 
     if (UseEgressAdmission())
     {
@@ -417,11 +516,77 @@ SwitchNode::EgressPipeline(Ptr<Packet> packet, uint16_t protocol, Ptr<PointToPoi
         packet->AddHeader(ppp);
     }
 
+    // INT on the queue this packet leaves behind
+    if (m_intVersion != 0)
+    {
+        AddInt(packet, out);
+    }
+    if (out.monitorIndex >= 0)
+    {
+        OnMonitorSample(out, MONITOR_OUT, out.egressUsed); // the queue it leaves behind, as INT
+    }
+
     if (ShouldResume(in))
     {
         SendPfc(inPort, false);
     }
     return packet;
+}
+
+void
+SwitchNode::AddInt(Ptr<Packet> packet, const PortState& port) const
+{
+    PppHeader ppp;
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ppp);
+    packet->RemoveHeader(ipv6Header);
+
+    IntHeader intHeader;
+    intHeader.SetVersion(m_intVersion);
+    intHeader.SetNextHeader(ipv6Header.GetNextHeader());
+    intHeader.SetQueueLength(port.egressUsed);
+    packet->AddHeader(intHeader);
+
+    ipv6Header.SetNextHeader(IntHeader::IPV6_NEXT_HEADER_INT);
+    ipv6Header.SetPayloadLength(ipv6Header.GetPayloadLength() + IntHeader::SIZE);
+    packet->AddHeader(ipv6Header);
+    packet->AddHeader(ppp);
+}
+
+void
+SwitchNode::OnMonitorSample(PortState& port, MonitorDirection direction, uint32_t queueLength)
+{
+    // Up past every threshold the queue exceeds, else down below every
+    // threshold it fell a hysteresis under
+    uint8_t& level = port.level[direction];
+    const uint8_t before = level;
+    const int64_t queue = queueLength;
+    while (level < port.levelUp.size() && queue > port.levelUp[level])
+    {
+        level++;
+    }
+    if (level == before)
+    {
+        while (level > 0 && queue < port.levelDown[level - 1])
+        {
+            level--;
+        }
+    }
+    if (level == before || m_intSnapshotCb.IsNull())
+    {
+        return;
+    }
+
+    // This direction only, over every monitored port
+    IntSnapshot snapshot{Simulator::Now(), direction, uint32_t(port.monitorIndex), level, queueLength,
+                         {}, {}};
+    for (const auto& dev : m_monitorPorts)
+    {
+        const PortState& p = m_ports.at(dev);
+        snapshot.levels.push_back(p.level[direction]);
+        snapshot.bytes.push_back(direction == MONITOR_OUT ? p.txBytesLp : p.rxBytesLp);
+    }
+    m_intSnapshotCb(snapshot);
 }
 
 int32_t

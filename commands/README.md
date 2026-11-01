@@ -152,6 +152,42 @@ commands/jct.py ar --iter 1       # only the second iteration (0-based; e.g. ski
   training, the per-stage gradient all-reduces (`iterN.allreduce.sK`).
 - **An iteration** ends at its global barrier.
 
+### Telemetry heatmaps: `commands/intplot.py`
+
+Needs a run with `--int=1` (see `--intLeaves`, `--intAggs`, `--intLevels`, `--intHysteresis`).
+A monitoring switch watches its uplinks in two directions: **out** (traffic it
+sends: its own egress queue, bytes sent) and **in** (traffic it receives: the
+upstream switch's egress queue from INT, bytes received). Leaf-spine: T0s watch
+their T1 uplinks. Fat tree: ToRs watch their aggregation uplinks and
+aggregation switches their core uplinks.
+
+```bash
+commands/intplot.py int-deg                # every monitored switch and direction: PNG + table
+commands/intplot.py int-deg --leaf 0:8     # only plane 0, T0 (ToR) 8
+commands/intplot.py int-deg --agg 0:3      # only plane 0, aggregation switch 3 (fat tree)
+commands/intplot.py int-deg --dir out      # only the traffic sent out
+commands/intplot.py int-deg --slot 20      # 20 us slots (default: about 400 slots)
+```
+
+- Each port has a queue level per direction: 0 below the first threshold, one
+  more per threshold crossed (`--intLevels`, default 10 / 45 / 80 % of the port
+  buffer; back down `--intHysteresis` 5 % below each). A snapshot on every
+  level change.
+- One figure per switch and direction (`<log>.p<plane>t<i>.out.png`,
+  `.p<plane>agg<i>.in.png`, ...), x = time, y = uplink, two heatmaps: the
+  time-weighted mean **level** over each slot (exact), and the **unused**
+  capacity (plane rate − Gbps sent / received, log scale from 1 Gbps, so 90 vs
+  99 Gbps is clear). Degraded links are in bold with their rate; iteration
+  ends are dashed.
+- unused capacity is interpolated between snapshots, which are taken only on
+  level changes of that direction: where there were none for a while, a flat
+  band is the mean over that gap, not a steady rate.
+- The table gives, per uplink, the share of time above each threshold, how
+  often it rose past the first one, MB sent / received and its ratio to the
+  mean uplink.
+- Older logs (busy/idle, with ECN columns; the first ones T0 / received only) still
+  plot, as one threshold.
+
 ### Transport and switch counters: `commands/stats.py`
 
 ```bash

@@ -47,6 +47,34 @@ IPv6, with **multiple planes**, driven by an **AI workload engine**.
 - `--degradeLinks=N`: N random T0–T1 links run at `--degradeRate` (50 Gbps),
   chosen with `mt19937(1)`. This is how failures are modelled (asymmetric bandwidth).
 
+### Fat tree (`--topo=fattree`, added 2026-10-26)
+
+- Leaf-spine stays the default. `--topo=fattree --k=K`: three tiers per plane,
+  T0 = ToR, T1 = aggregation, T2 = core (`t2s`). Pods of K ToRs and K
+  aggregation switches (full mesh inside the pod); aggregation switch a of
+  every pod connects to the K cores of group a (K * K cores). Defaults: 1
+  plane (`--planes` defaults to 4 for leaf-spine, 1 for fat tree), 256
+  servers, 16 ToRs, K = 4, so 4 pods, 16 aggregation, 16 cores, 100 Gbps / 1
+  us links. A ToR has K uplinks: 16 servers per ToR give **4:1
+  oversubscription at the ToR** (the user's spec), 1:1 above.
+- Routing: ToR -> other ToRs ECMP over its K uplinks; aggregation -> down to a
+  ToR of its pod, else ECMP over its K cores; core -> down to the pod. SRv6:
+  [ToR] / [ToR, Agg, ToR] (K paths within a pod) / [ToR, Agg, Core, Agg, ToR]
+  (K * K paths across pods); uSIDs T0 0x0100+i, T1 0x0200+g, T2 0x8000+c.
+  Base RTT: 2 / 4 / 6 links each way.
+- INT is added by the aggregation switches (the tier above the ToRs);
+  `--intLeaves` picks ToRs, whose K uplinks are monitored (intplot labels them
+  `Agg j`). `--degradeLinks` draws from both tiers (ToR-Agg printed `T0 i - T1
+  a`, a = uplink index; Agg-Core printed `Agg g - Core c`). Fabric load prints
+  ToR->Agg, Agg->ToR, Agg->Core, Core->Agg. Run names `_P1_S256_FT16xK4_...`.
+  `jct.py` gives no ideal (`nan`): its bound models two tiers only.
+- Checked: leaf-spine bit-identical; every LB mode completes on the fat tree;
+  2 MB all-to-all with spray 777 us vs the 640 us ToR-uplink bound (82%), ring
+  all-reduce 1328 vs 1200 us; load max/mean ~1.03 on every tier;
+  Agg->Core / ToR->Agg bytes = 0.80 = 12/15 (the cross-pod share). The 4:1
+  ToR uplinks overflow under all-to-all: about 19% of packets trimmed and
+  retransmitted with spray.
+
 ### Headers (`src/point-to-point/model/`)
 
 - **`bth-header`**: IBTA BTH (24-bit PSN, `BthHeader::UnwrapPsn` for long-lived
@@ -64,6 +92,7 @@ IPv6, with **multiple planes**, driven by an **AI workload engine**.
   the SRH carries the full path and is shifted in place.
 - **`pfc-header`**: priority + pause/resume (opcode 0x0101).
 - **`packet-tag`**: size + ingress device.
+- **`int-header`** (added 2026-10-21): INT telemetry, an 8-byte IPv6 extension header (Next Header 253, experimental) right after the IPv6 header: next header, version (1 = queue length), low-priority queue length in bytes.
 
 ### Switch (`switch-node`)
 
@@ -142,11 +171,73 @@ IPv6, with **multiple planes**, driven by an **AI workload engine**.
   alone. The paper's freezing mode (failure mitigation) was implemented and
   then removed on 2026-10-18, since no failures are modeled. With `reps`, `--spray`, `EcmpEvSetSize`, `EvsPerPlane`,
   `--evOnEcn` and `--evOnLoss` do not apply. Run names get `_REPS`.
+- **PLB (`--lb=plb`; presets `plb_trim` and `srv6plb_trim`), added
+  2026-10-22:** Protective Load Balancing (Qureshi et al., SIGCOMM 2022; Linux
+  `tcp_plb.c`). As in the paper (since 2026-10-26, preset `plb_trim`, run names
+  `_ECMP_PLB`), each plane of a QP sticks to one random IPv6 flow label hashed
+  by ECMP, and a repath draws a new random label (different, but it may hash
+  to the same path). With `--srcRoute=1` (`srv6plb_trim`, `_SRV6_PLB`; the
+  first version, 2026-10-22) each plane sticks to one random SRv6 path and
+  repaths to another path of the plane. Rounds of about one RTT per plane (end on the
+  SACK of a packet sent after the round began); a round is congested when at
+  least K = `PlbCongestionThreshold` (0.5) of its acked bytes were ECN-marked,
+  otherwise the count resets. After M = `PlbIdleRehashRounds` (3) congested
+  rounds in a row the plane repaths once idle (nothing in flight), after
+  N = `PlbRehashRounds` regardless; the new path is uniform among the plane's
+  other paths. **N defaults to 3 (= M), not Linux's 12:** reordering is
+  tolerated here, so there is no reason to wait for idle (user's decision).
+  An RTO repaths the oldest hole's plane and pauses congestion repaths there
+  for `PlbSuspendRto` (1 ms, Linux 60 s) to twice that. Trims only drive NSCC.
+  Counters: `PLB n congested rounds / m repaths (k on RTO)`. Verified on a 2 MB
+  all-to-all with 64 degraded links: one path per plane between repaths, every
+  repath after exactly 3 congested rounds and onto another path of the same
+  plane, rounds 12-107 us (p10-p90), bit-identical reruns, other modes
+  unchanged. The RTO path is not exercised there (0 RTOs).
+  Flow-label PLB checked the same way (2026-10-26): one label per plane between
+  repaths, every repath a new label, bit-identical reruns; T0->T1 max/mean 1.87
+  on that run (per-flow hashing), SRv6 PLB unchanged (133.264 us).
+  Results (`results/lb-int-plb`, SRv6 PLB, N = M = 3): matches REPS on
+  all-to-all with 64 degraded links (1530 vs 1528 us at 64 MB), but 65% slower
+  than REPS on ring all-reduce: 16 QPs per T0 pair collide on random spines
+  and NSCC keeps their marking (20-40%) below K = 0.5, so they rarely repath.
 - **Trimming** (`--trim`): on buffer overflow, the packet becomes a fresh
   header-only packet sent at high priority.
 - **SRv6:** switch identity = (plane locator, switch uSID). A switch forwards
   on the active SID; otherwise it uses its IPv6 route table.
 - Buffer sizes are compile-time constants (`switch-node.h`); the ECN thresholds are options (`--ecnKmin` / `--ecnKmax` / `--ecnPmax`).
+- **Per-port counters** (added 2026-10-21), split by priority, IPv6 sizes, PFC
+  frames not counted: `GetRxBytesLp/Hp` (ingress; LP counted before admission,
+  so dropped/trimmed bytes count), `GetTxBytesLp/Hp` (egress; trimmed packets
+  count as HP at their trimmed size). The ECN-marked byte counters (rx, then
+  tx) were removed on 2026-10-26 at the user's request.
+- **INT** (added 2026-10-21; `--int=1`, default 0 = off; run names get
+  `_INT1`): switches with an INT version add an 8-byte `IntHeader` at dequeue
+  to every IPv6 packet (LP and HP) with that port's LP queue left behind
+  (`egressUsed`): T1s (leaf-spine), aggregation and core switches (fat tree).
+  Every switch strips it first thing on ingress, so the SRH / UDP parsers,
+  ECMP hash and counters never see it (counters exclude the 8 bytes; the wire
+  carries them). With `--int=0` runs are bit-identical to before.
+- **Telemetry (2026-10-26: two directions, multiple levels):** a monitoring
+  switch watches its uplinks in two directions: **out** = its own egress
+  queue, sampled at every dequeue, with LP bytes sent; **in** = the upstream
+  egress queue from INT, with LP bytes received. Leaf-spine: chosen T0s
+  (`--intLeaves`) watch their T1 uplinks. Fat tree: chosen ToRs (`--intLeaves`)
+  their aggregation uplinks, chosen aggregation switches (`--intAggs`, default
+  all) their core uplinks. Selection syntax: `all` | `none` | list of `i` (every
+  plane) or `p:i`, separated by `+` (run.sh sweeps commas).
+  Each port has a **level** per direction: up past each of `--intLevels`
+  (default `10+45+80`, % of the port buffer, i.e. 50 / 225 / 400 KB at 100G)
+  when the queue exceeds it, back down once below it minus `--intHysteresis`
+  (default 5, so 5 / 40 / 75 %). Every level change snapshots that direction
+  only: per watched port its level and cumulative bytes. Log
+  `logs/<run>.int`, streamed: `time_ns,plane,switch,index,dir,port,level,
+  queue_bytes,levels,bytes` (levels = one digit per port, bytes ';'-separated).
+  The run prints the levels (`Telemetry levels ... up 10 45 80, down 5 40 75`).
+  Watching is passive: runs are bit-identical with or without it (checked on
+  `results/telemetry-check` vs `results/telemetry-levels`), and every level
+  change in those logs obeys the up / down rule. `--intT1` / `--intT2` and the
+  busy/idle state were replaced by the levels. `commands/intplot.py` draws, per
+  switch and direction, the mean level and the unused capacity over time.
 
 ### NIC and transport
 

@@ -1,8 +1,10 @@
 #ifndef SWITCH_NODE_H
 #define SWITCH_NODE_H
 
+#include "ns3/callback.h"
 #include "ns3/ipv6-address.h"
 #include "ns3/node.h"
+#include "ns3/nstime.h"
 #include "ns3/random-variable-stream.h"
 
 #include "point-to-point-net-device.h"
@@ -16,6 +18,7 @@ class Packet;
 class Address;
 class Ipv6Header;
 class Srv6RoutingHeader;
+class IntHeader;
 
 /**
  * Output-queued IPv6 switch with a shared-buffer MMU. IPv4 is not supported.
@@ -61,6 +64,19 @@ class Srv6RoutingHeader;
  * is cut to its headers (IPv6 [+ SRH] + UDP + BTH with extensions), marked
  * with the BTH trimmed bit and DSCP_HIGH_PRIORITY, and forwarded as high
  * priority so the receiver can NACK it. When disabled, such packets are dropped.
+ *
+ * Telemetry (SetIntVersion / SetIntMonitor): a switch with an INT version
+ * adds an IntHeader with its low-priority queue length to every IPv6 packet it
+ * sends; every switch strips it on ingress. A monitoring switch watches a set
+ * of ports (its uplinks) in two directions:
+ *   - out (send out): the queue of its own egress port, sampled at dequeue;
+ *   - in (send in): the upstream switch's egress queue towards it, from INT.
+ * Each port has a level per direction, 0..n for n thresholds (fractions of
+ * the port buffer, by default 10%, 45%, 80%): it moves up past a threshold
+ * when the queue exceeds it and back down once the queue falls a hysteresis
+ * (5%) below it. On every level change it records a snapshot of that
+ * direction only: the level and LP bytes (sent for out, received for in) of
+ * every watched port.
  *
  * Priorities (see PointToPointQueue): the MMU, PFC and ECN above apply only to
  * PRIORITY_LOW (data). PRIORITY_HIGH (ACK/SACK/NACK/trimmed/...) bypasses
@@ -125,6 +141,49 @@ public:
     void SetTrimEnabled(bool enabled);
 
     /**
+     * INT version this switch adds (IntHeader::VERSION_*) to every IPv6 packet
+     * it sends, at dequeue, with the low-priority queue length of the egress
+     * port. 0 (default): none. Meant for spines; INT is stripped on ingress
+     * by every switch whatever its own setting.
+     */
+    void SetIntVersion(uint8_t version);
+
+    /** Direction a monitored port is watched in. */
+    enum MonitorDirection : uint8_t
+    {
+        MONITOR_OUT = 0, //!< Sent out: own egress queue
+        MONITOR_IN = 1,  //!< Sent in: the upstream egress queue, from INT
+    };
+
+    /** A monitoring switch's record of one direction of its ports, taken on a level change. */
+    struct IntSnapshot
+    {
+        Time time;
+        MonitorDirection direction;
+        uint32_t port;         //!< Port (index into SetIntMonitor's list) that changed
+        uint8_t level;         //!< Its new level
+        uint32_t queueLength;  //!< Queue length that triggered the change (bytes)
+        std::vector<uint8_t> levels; //!< Per port, in this direction, after the change
+        std::vector<uint64_t> bytes; //!< Per port: GetTxBytesLp (out) or GetRxBytesLp (in)
+    };
+
+    /**
+     * Watch devices \p ports (the uplinks) in both directions: out, on this
+     * switch's own egress queue at every dequeue; in, on the INT of every
+     * packet arriving on them. \p levels are increasing fractions of each
+     * port's buffer (at most 9); a port's level, per direction, rises past
+     * levels[i] when the queue exceeds it and drops back once the queue falls
+     * below levels[i] - \p hysteresis. Each change passes an IntSnapshot of
+     * that direction to the callback set with SetIntSnapshotCallback. Call
+     * after the devices are added.
+     */
+    void SetIntMonitor(const std::vector<uint32_t>& ports,
+                       const std::vector<double>& levels,
+                       double hysteresis);
+    /** Receives every IntSnapshot as it is taken (nothing is kept in the switch). */
+    void SetIntSnapshotCallback(Callback<void, const IntSnapshot&> cb) { m_intSnapshotCb = cb; }
+
+    /**
      * Identity of this switch, matched against SRv6 SIDs.
      * \param plane    fabric plane; equals the SID locator
      * \param switchId switch within the plane; equals the uSID
@@ -133,8 +192,17 @@ public:
     uint32_t GetPlane() const;
     uint16_t GetSwitchId() const;
 
-    /** Low-priority (data) bytes sent on device \p ifIndex. */
-    uint64_t GetTxBytes(uint32_t ifIndex) const;
+    // Per-port byte counters, split by priority: LP = PRIORITY_LOW (data), HP =
+    // PRIORITY_HIGH IPv6 packets (ACK/SACK/NACK/trimmed/...). PFC frames are not
+    // counted. Sizes are IPv6 packet sizes.
+    /** LP bytes received on device \p ifIndex (before admission: dropped/trimmed included). */
+    uint64_t GetRxBytesLp(uint32_t ifIndex) const;
+    /** HP bytes received on device \p ifIndex. */
+    uint64_t GetRxBytesHp(uint32_t ifIndex) const;
+    /** LP bytes sent on device \p ifIndex. */
+    uint64_t GetTxBytesLp(uint32_t ifIndex) const;
+    /** HP bytes sent on device \p ifIndex (trimmed packets included, at their trimmed size). */
+    uint64_t GetTxBytesHp(uint32_t ifIndex) const;
     uint64_t GetDropCount() const { return m_dropCount; }
     uint64_t GetTrimCount() const { return m_trimCount; }
     /** Largest low-priority egress queue seen on any port (bytes). */
@@ -178,7 +246,14 @@ protected:
         int32_t portBuffer{0};   //!< Buffer bytes of this port (BUFFER_BYTES_PER_GBPS x rate)
         bool paused{false};      //!< PFC pause sent to the upstream of this port
         bool ecnEnabled{true};   //!< ECN bit marked as egress
-        uint64_t txBytes{0};     //!< Low-priority bytes sent (as egress)
+        uint64_t rxBytesLp{0};   //!< Low-priority bytes received (as ingress)
+        uint64_t rxBytesHp{0};   //!< High-priority bytes received (as ingress)
+        uint64_t txBytesLp{0};   //!< Low-priority bytes sent (as egress)
+        uint64_t txBytesHp{0};   //!< High-priority bytes sent (as egress)
+        int32_t monitorIndex{-1}; //!< Index among the monitored ports, or -1
+        std::vector<int32_t> levelUp;   //!< Monitored: level i+1 above this queue (bytes)
+        std::vector<int32_t> levelDown; //!< Monitored: back to level i below this queue (bytes)
+        uint8_t level[2]{0, 0};         //!< Per MonitorDirection
     };
 
     /** Shared bytes used by \p port: ingress bytes beyond its reservation. */
@@ -193,6 +268,13 @@ protected:
     bool ShouldMarkEcn(const PortState& port);
     /** Set the ECN bit (RED) of \p header. */
     void MarkIfCongested(const PortState& port, Ipv6Header& header);
+    /** Add an IntHeader with \p port's queue length to \p packet (PPP framed). */
+    void AddInt(Ptr<Packet> packet, const PortState& port) const;
+    /** Busy/idle of monitored \p port in \p direction from a queue sample; snapshot on a change. */
+    void OnMonitorSample(PortState& port, MonitorDirection direction, uint32_t queueLength);
+
+    /** State of device \p ifIndex, or nullptr if it is not a switch port. */
+    const PortState* GetPort(uint32_t ifIndex) const;
     bool ShouldPause(const PortState& port) const;
     bool ShouldResume(const PortState& port) const;
     /** Send a PFC pause/resume for PRIORITY_LOW upstream of \p port. */
@@ -243,6 +325,10 @@ protected:
 
     int32_t m_sharedPoolSize{0}; //!< Buffer minus all reserved and headroom space
     int32_t m_sharedPoolUsed{0}; //!< Shared bytes in use, over all ingress ports
+
+    uint8_t m_intVersion{0};                                 //!< INT added at egress; 0: none
+    std::vector<Ptr<PointToPointNetDevice>> m_monitorPorts;  //!< Monitored ports, in order
+    Callback<void, const IntSnapshot&> m_intSnapshotCb;
 
     uint64_t m_dropCount{0};
     uint64_t m_trimCount{0};

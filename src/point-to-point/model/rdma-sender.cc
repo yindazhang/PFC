@@ -144,10 +144,12 @@ RdmaSender::GetTypeId()
                           MakeUintegerChecker<uint32_t>(1))
             .AddAttribute("LoadBalancing",
                           "How EVs (paths) are chosen: Mrc (ECMP / spraying, or SRv6 active "
-                          "and backup EV sets) or Reps (Recycled Entropy Packet Spraying)",
+                          "and backup EV sets), Reps (Recycled Entropy Packet Spraying) or Plb "
+                          "(Protective Load Balancing: one flow label per plane, rehashed on "
+                          "persistent congestion; with SourceRouting one SRv6 path per plane)",
                           EnumValue(LB_MRC),
                           MakeEnumAccessor<LoadBalancing>(&RdmaSender::m_loadBalancing),
-                          MakeEnumChecker(LB_MRC, "Mrc", LB_REPS, "Reps"))
+                          MakeEnumChecker(LB_MRC, "Mrc", LB_REPS, "Reps", LB_PLB, "Plb"))
             .AddAttribute("RepsBufferSize",
                           "REPS: cached EVs per plane (circular buffer)",
                           UintegerValue(8),
@@ -158,7 +160,34 @@ RdmaSender::GetTypeId()
                           "connection); 0: one BDP per plane",
                           UintegerValue(0),
                           MakeUintegerAccessor(&RdmaSender::m_repsExplorePackets),
-                          MakeUintegerChecker<uint32_t>());
+                          MakeUintegerChecker<uint32_t>())
+            .AddAttribute("PlbCongestionThreshold",
+                          "PLB: a round is congested when at least this share of its "
+                          "acknowledged bytes was ECN-marked (K; Linux tcp_plb_cong_thresh)",
+                          DoubleValue(0.5),
+                          MakeDoubleAccessor(&RdmaSender::m_plbCongestionThreshold),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("PlbIdleRehashRounds",
+                          "PLB: consecutive congested rounds after which a plane repaths as "
+                          "soon as it has nothing in flight (M; tcp_plb_idle_rehash_rounds)",
+                          UintegerValue(3),
+                          MakeUintegerAccessor(&RdmaSender::m_plbIdleRehashRounds),
+                          MakeUintegerChecker<uint32_t>(1))
+            .AddAttribute("PlbRehashRounds",
+                          "PLB: consecutive congested rounds after which a plane repaths "
+                          "even with packets in flight (N; Linux tcp_plb_rehash_rounds = 12). "
+                          "Default 3 = M: the transport tolerates reordering, so there is no "
+                          "reason to wait for an idle plane",
+                          UintegerValue(3),
+                          MakeUintegerAccessor(&RdmaSender::m_plbRehashRounds),
+                          MakeUintegerChecker<uint32_t>(1))
+            .AddAttribute("PlbSuspendRto",
+                          "PLB: after an RTO repaths a plane, no congestion repath on it for "
+                          "this long to twice this long (random). Linux uses 60 s "
+                          "(tcp_plb_suspend_rto_sec); scaled down to the simulated time spans",
+                          TimeValue(MilliSeconds(1)),
+                          MakeTimeAccessor(&RdmaSender::m_plbSuspendRto),
+                          MakeTimeChecker());
     return tid;
 }
 
@@ -183,6 +212,10 @@ RdmaSender::RdmaSender(QpInfo qp)
       m_loadBalancing(LB_MRC),
       m_repsBufferSize(8),
       m_repsExplorePackets(0),
+      m_plbCongestionThreshold(0.5),
+      m_plbIdleRehashRounds(3),
+      m_plbRehashRounds(3),
+      m_plbSuspendRto(MilliSeconds(1)),
       m_evRng(qp.id),
       m_ecmpEvSetSize(0)
 {
@@ -314,6 +347,10 @@ RdmaSender::AddPlane(DataRate rate, Callback<void> wakeup)
     if (m_loadBalancing == LB_REPS)
     {
         InitReps(plane);
+    }
+    else if (m_loadBalancing == LB_PLB)
+    {
+        InitPlb(plane);
     }
     else if (m_sourceRouting)
     {
@@ -489,6 +526,116 @@ RdmaSender::RepsOnAck(uint32_t plane, uint32_t ev, bool ecn)
 }
 
 void
+RdmaSender::InitPlb(uint32_t plane)
+{
+    NS_ABORT_MSG_IF(m_sourceRouting &&
+                        (plane >= m_planePaths.size() || m_planePaths[plane].empty()),
+                    "QP " << m_qp.id << ": SourceRouting needs AddPath() for plane " << plane
+                            << " before AddPlane()");
+    NS_ABORT_MSG_IF(m_plbIdleRehashRounds > m_plbRehashRounds,
+                    "PLB needs PlbIdleRehashRounds <= PlbRehashRounds");
+    m_plb.resize(plane + 1);
+    if (m_sourceRouting)
+    {
+        const std::vector<uint32_t>& paths = m_planePaths[plane];
+        m_plb[plane].ev = paths[m_evRng() % paths.size()];
+    }
+    else
+    {
+        m_plb[plane].ev = m_evRng() & FLOW_LABEL_MASK; // the plane's random flow label
+    }
+}
+
+int32_t
+RdmaSender::PlbNextEv(uint32_t plane)
+{
+    PlbState& plb = m_plb[plane];
+    if (plb.roundStart < 0)
+    {
+        plb.roundStart = Simulator::Now().GetNanoSeconds(); // first round of the plane
+    }
+    PlbCheckRepath(plane); // nothing in flight: an idle repath causes no reordering
+    return plb.ev;
+}
+
+void
+RdmaSender::PlbOnAck(uint32_t plane, uint32_t bytes, bool ecn, int64_t sendTime)
+{
+    if (plane >= m_plb.size())
+    {
+        return;
+    }
+    PlbState& plb = m_plb[plane];
+    plb.roundBytes += bytes;
+    plb.roundEcnBytes += ecn ? bytes : 0;
+    if (sendTime < 0 || plb.roundStart < 0 || sendTime < plb.roundStart)
+    {
+        return; // the round goes on until a packet sent during it is acknowledged
+    }
+
+    // End of a round: congested if enough of its bytes were ECN-marked
+    if (plb.roundBytes > 0 && plb.roundEcnBytes >= m_plbCongestionThreshold * plb.roundBytes)
+    {
+        s_stats.plbCongestedRounds++;
+        plb.congestedRounds = std::min(plb.congestedRounds + 1, m_plbRehashRounds);
+    }
+    else
+    {
+        plb.congestedRounds = 0;
+    }
+    plb.roundStart = Simulator::Now().GetNanoSeconds();
+    plb.roundBytes = 0;
+    plb.roundEcnBytes = 0;
+    PlbCheckRepath(plane);
+}
+
+void
+RdmaSender::PlbCheckRepath(uint32_t plane)
+{
+    PlbState& plb = m_plb[plane];
+    if (plb.congestedRounds < m_plbIdleRehashRounds)
+    {
+        return;
+    }
+    bool idle = m_cc[plane].inflightBytes == 0;
+    bool forced = plb.congestedRounds >= m_plbRehashRounds;
+    if ((!idle && !forced) || Simulator::Now().GetNanoSeconds() < plb.pauseUntil)
+    {
+        return;
+    }
+    PlbRepath(plane);
+    s_stats.plbRepaths++;
+}
+
+void
+RdmaSender::PlbRepath(uint32_t plane)
+{
+    PlbState& plb = m_plb[plane];
+    plb.congestedRounds = 0;
+    if (!m_sourceRouting)
+    {
+        // As the paper / Linux sk_rethink_txhash: a new random flow label, which
+        // ECMP hashes to a path that may happen to be the same one
+        uint32_t label;
+        do
+        {
+            label = m_evRng() & FLOW_LABEL_MASK;
+        } while (label == plb.ev);
+        plb.ev = label;
+        return;
+    }
+    const std::vector<uint32_t>& paths = m_planePaths[plane];
+    if (paths.size() < 2)
+    {
+        return;
+    }
+    // Uniformly among the plane's other paths
+    uint32_t current = std::find(paths.begin(), paths.end(), plb.ev) - paths.begin();
+    uint32_t next = m_evRng() % (paths.size() - 1);
+    plb.ev = paths[next >= current ? next + 1 : next];
+}
+
+void
 RdmaSender::UpdateLimits(PlaneCc& cc)
 {
     cc.targetRtt = m_targetRttFactor * cc.baseRtt;
@@ -537,7 +684,7 @@ bool
 RdmaSender::HasPendingData(uint32_t plane) const
 {
     return (!m_lost.empty() || CanSendNew()) && IsWindowOpen(plane) &&
-           (!m_sourceRouting || m_loadBalancing == LB_REPS ||
+           (!m_sourceRouting || m_loadBalancing != LB_MRC ||
             (plane < m_activeEvs.size() && !m_activeEvs[plane].empty()));
 }
 
@@ -566,6 +713,7 @@ RdmaSender::GenerateNextPacket(uint32_t plane)
         return nullptr;
     }
     int32_t ev = m_loadBalancing == LB_REPS ? RepsNextEv(plane)
+                 : m_loadBalancing == LB_PLB  ? PlbNextEv(plane)
                  : m_sourceRouting             ? SelectEv(plane)
                                                : -1;
 
@@ -800,6 +948,12 @@ RdmaSender::ProcessSack(const BthHeader& bth, uint32_t plane)
         {
             RepsOnAck(Info(psn).plane, ev, cc.ecnMarkedPackets > 0);
         }
+    }
+
+    if (m_loadBalancing == LB_PLB && ccBytes > 0)
+    {
+        bool known = psn >= m_cumAck && psn < m_nextPsn && Info(psn).state != EMPTY;
+        PlbOnAck(plane, ccBytes, cc.ecnMarkedPackets > 0, known ? Info(psn).sendTime : -1);
     }
 
     uint32_t ackedBytes = 0;
@@ -1074,6 +1228,17 @@ RdmaSender::OnRto()
     if (m_sourceRouting && m_evOnLoss && Info(m_cumAck).state == IN_FLIGHT)
     {
         OnEvSignal(Info(m_cumAck).ev); // the oldest hole timed out on its path
+    }
+    if (m_loadBalancing == LB_PLB && Info(m_cumAck).state == IN_FLIGHT)
+    {
+        // As TCP rehashes on an RTO: the oldest hole's plane moves to another
+        // path, and congestion repathing pauses there
+        uint32_t plane = Info(m_cumAck).plane;
+        PlbRepath(plane);
+        s_stats.plbRtoRepaths++;
+        int64_t suspend = m_plbSuspendRto.GetNanoSeconds();
+        m_plb[plane].pauseUntil = Simulator::Now().GetNanoSeconds() + suspend +
+                                  (suspend > 0 ? int64_t(m_evRng() % uint64_t(suspend)) : 0);
     }
     bool anyLost = false;
     for (uint32_t psn = m_cumAck; psn < m_nextPsn; psn++)

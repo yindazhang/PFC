@@ -16,8 +16,13 @@
 #   srv6all_trim    MRC SRv6 source routing, all paths per plane active, trimming
 #   reps_trim       REPS over ECMP flow labels, trimming
 #   srv6reps_trim   REPS over SRv6 paths, trimming
+#   plb_trim        PLB as in the paper: one flow label per plane, rehashed on ECN, trimming
+#   srv6plb_trim    PLB over SRv6 paths (one path per plane, repath on ECN), trimming
 #
-# Topology (defaults 4 planes, 256 servers, 16 T0 + 16 T1 per plane, non-blocking):
+# Topology: --topo=leafspine (default) or --topo=fattree --k=K (3 tiers: K ToRs and K
+# aggregation switches per pod, K * K cores; default 1 plane, 16 ToRs, K = 4, so 16
+# servers per ToR and 4:1 oversubscription at the ToR).
+# Leaf-spine (defaults 4 planes, 256 servers, 16 T0 + 16 T1 per plane, non-blocking):
 #   --planes=P --servers=N --t0=A --t1=B    N servers / A T0s per T0; B > N/A is
 #   undersubscribed, B < N/A oversubscribed. Like any option they can be swept.
 #
@@ -30,10 +35,13 @@
 #   --evOnLoss=0|1  SRv6 path switching on a trim NACK or an RTO (default 1)
 #
 # Load balancing:
-#   --lb=mrc|reps   mrc (default): ECMP / spraying, or with --srcRoute the MRC
+#   --lb=mrc|reps|plb  mrc (default): ECMP / spraying, or with --srcRoute the MRC
 #                   active + backup EV sets; reps: Recycled Entropy Packet
 #                   Spraying, over flow labels or (--srcRoute) SRv6 paths. Tune with
-#                   --ns3::RdmaSender::RepsBufferSize / RepsExplorePackets
+#                   --ns3::RdmaSender::RepsBufferSize / RepsExplorePackets;
+#                   plb: one flow label per plane (with --srcRoute: one SRv6 path),
+#                   rehashed after congested rounds. Tune with --ns3::RdmaSender::PlbCongestionThreshold /
+#                   PlbIdleRehashRounds / PlbRehashRounds / PlbSuspendRto
 #
 # Script options:
 #   -t NAME   experiment name: results go to <results>/NAME (default: date-time)
@@ -122,6 +130,8 @@ preset() {
     srv6all_trim) echo "--srcRoute=1 --pfc=0 --trim=1 --ns3::RdmaSender::EvsPerPlane=65535" ;; # clamped to the paths per plane
     reps_trim) echo "--lb=reps --spray=1 --srcRoute=0 --pfc=0 --trim=1" ;;
     srv6reps_trim) echo "--lb=reps --srcRoute=1 --pfc=0 --trim=1" ;;
+    plb_trim) echo "--lb=plb --spray=1 --srcRoute=0 --pfc=0 --trim=1" ;;
+    srv6plb_trim) echo "--lb=plb --srcRoute=1 --pfc=0 --trim=1" ;;
     *)
         echo "Unknown --config preset '$1'" >&2
         exit 1

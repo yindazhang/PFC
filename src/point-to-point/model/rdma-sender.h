@@ -94,6 +94,28 @@ struct QpInfo
  *   - trim NACKs and RTOs do not change the buffer. The paper's freezing
  *     mode (failure mitigation) is not implemented: no failures are modeled.
  *
+ * LoadBalancing = Plb (PLB, Protective Load Balancing, Qureshi et al., SIGCOMM
+ * 2022, as in Linux tcp_plb.c). As in the paper, each plane of the QP sticks to
+ * one random IPv6 flow label, hashed by ECMP switches, and repaths by drawing a
+ * new random flow label (a different label, which may hash to the same path).
+ * With SourceRouting it sticks to one random SRv6 path of the plane instead and
+ * repaths to another one (never the current path). When to repath:
+ *   - rounds of about one RTT per plane: a round ends on the first SACK, on
+ *     that plane, of a packet sent after the round started;
+ *   - a round is congested when at least PlbCongestionThreshold of the bytes
+ *     acknowledged in it were ECN-marked (K); otherwise the count of
+ *     consecutive congested rounds resets;
+ *   - after PlbIdleRehashRounds congested rounds in a row (M) the plane
+ *     repaths once it has nothing in flight (no reordering), or after
+ *     PlbRehashRounds (N) regardless; the count then restarts. Defaults
+ *     M = N = 3 (Linux: N = 12): the transport tolerates reordering, so a
+ *     plane repaths after 3 congested rounds without waiting to be idle;
+ *   - an RTO repaths the plane of the oldest outstanding packet (TCP rehashes
+ *     on RTO) and suspends congestion repathing on it for PlbSuspendRto to
+ *     2 x PlbSuspendRto (random);
+ *   - trim NACKs only drive congestion control. PacketSpraying, EcmpEvSetSize,
+ *     EvsPerPlane, EvOnEcn and EvOnLoss do not apply.
+ *
  * Reliability: selective. SACKs advance the cumulative ack and mark
  * out-of-order arrivals; NACKs (trimmed / out of MPR) and time-based reorder
  * detection (RACK-like: a packet is lost once a packet sent after it was
@@ -174,6 +196,7 @@ public:
     {
         LB_MRC,  //!< MRC: ECMP / spraying, or SRv6 active and backup EV sets
         LB_REPS, //!< REPS: recycle the EVs of unmarked SACKs
+        LB_PLB,  //!< PLB: one flow label (or SRv6 path) per plane, repath on persistent congestion
     };
 
     /** Totals over every sender of the simulation. */
@@ -192,6 +215,9 @@ public:
         uint64_t repsExploreEvs{0};  //!< REPS: of which by the exploration rule
         uint64_t repsOverwritten{0}; //!< REPS: valid EVs overwritten before being reused
         uint64_t repsRecycledEvs{0}; //!< REPS: packets sent on a cached EV
+        uint64_t plbCongestedRounds{0}; //!< PLB: rounds at or above the ECN threshold
+        uint64_t plbRepaths{0};      //!< PLB: repaths on congestion
+        uint64_t plbRtoRepaths{0};   //!< PLB: repaths on an RTO
     };
 
     static const GlobalStats& GetGlobalStats() { return s_stats; }
@@ -246,6 +272,17 @@ private:
         bool explorePending{true};   //!< Start exploring on the next packet (new / idle)
     };
 
+    /** PLB state of one plane. */
+    struct PlbState
+    {
+        uint32_t ev{0};              //!< The plane's current flow label (SourceRouting: path)
+        int64_t roundStart{-1};      //!< ns; -1 until the plane first sends
+        uint64_t roundBytes{0};      //!< Bytes acknowledged in the current round
+        uint64_t roundEcnBytes{0};   //!< Of which ECN-marked
+        uint32_t congestedRounds{0}; //!< Consecutive congested rounds (capped at N)
+        int64_t pauseUntil{0};       //!< ns: no congestion repath before (after an RTO)
+    };
+
     PacketInfo& Info(uint32_t psn) { return m_window[psn % m_window.size()]; }
     /** Grow the ring (up to the MPR) until every PSN in [m_cumAck, m_nextPsn) has a slot. */
     void GrowWindow();
@@ -291,6 +328,17 @@ private:
     uint32_t RepsRandomEv(uint32_t plane);
     /** SACK of a packet sent with \p ev on \p plane. */
     void RepsOnAck(uint32_t plane, uint32_t ev, bool ecn);
+
+    // PLB
+    void InitPlb(uint32_t plane);
+    /** EV of the next packet on \p plane: its path, after an idle repath if due. */
+    int32_t PlbNextEv(uint32_t plane);
+    /** SACK on \p plane of \p bytes sent at \p sendTime (ns, -1 unknown). */
+    void PlbOnAck(uint32_t plane, uint32_t bytes, bool ecn, int64_t sendTime);
+    /** Repath if \p plane has had enough congested rounds (M idle, or N). */
+    void PlbCheckRepath(uint32_t plane);
+    /** Move \p plane to another random path of the plane. */
+    void PlbRepath(uint32_t plane);
 
     /** NSCC state of one plane. */
     struct PlaneCc
@@ -349,6 +397,10 @@ private:
     LoadBalancing m_loadBalancing;
     uint32_t m_repsBufferSize;
     uint32_t m_repsExplorePackets; //!< 0: one BDP per plane
+    double m_plbCongestionThreshold; //!< K: ECN-marked share of a congested round
+    uint32_t m_plbIdleRehashRounds;  //!< M: congested rounds before an idle repath
+    uint32_t m_plbRehashRounds;      //!< N: congested rounds before a forced repath
+    Time m_plbSuspendRto;            //!< No congestion repath for this long after an RTO
 
     uint32_t m_mtu{0};
 
@@ -367,6 +419,7 @@ private:
     std::vector<uint32_t> m_ecmpEvs; //!< Hash-based EV set (EcmpEvSetSize > 0), rotated
     uint32_t m_ecmpEvSetSize;
     std::vector<RepsState> m_reps; //!< [plane] (LB_REPS)
+    std::vector<PlbState> m_plb;   //!< [plane] (LB_PLB)
     static GlobalStats s_stats;
 
     // Messages

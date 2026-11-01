@@ -51,7 +51,13 @@ main(int argc, char* argv[])
                  "without PFC: shared-buffer admission per egress queue (0: per ingress port)",
                  egressAdmission);
     cmd.AddValue("mtuShift", "log2 of the MTU payload bytes: 8..12 (256..4096), by default 12", mtuShift);
-    cmd.AddValue("planes", "topology: number of planes (NICs per server)", topo.numPlanes);
+    cmd.AddValue("topo", "topology: leafspine (default) or fattree (3 tiers, see --k)", topo.type);
+    cmd.AddValue("k",
+                 "fattree: ToRs and aggregation switches per pod, cores per aggregation group "
+                 "(K * K cores)",
+                 topo.k);
+    cmd.AddValue("planes", "topology: number of planes (NICs per server); default leafspine 4, fattree 1",
+                 topo.numPlanes);
     cmd.AddValue("servers", "topology: number of servers (one GPU each), a multiple of t0",
                  topo.numServers);
     cmd.AddValue("t0", "topology: T0 switches per plane (at most 256)", topo.numT0PerPlane);
@@ -66,8 +72,10 @@ main(int argc, char* argv[])
     cmd.AddValue("ecnKmax", "RED Kmax (KB) for a 100 Gbps port; 0: 4 x ecnKmin", ecnKmaxKB);
     cmd.AddValue("ecnPmax", "RED marking probability at Kmax", ecnPmax);
     cmd.AddValue("lb",
-                 "load balancing: mrc (ECMP / spray, or SRv6 active and backup EV sets) or reps "
-                 "(Recycled Entropy Packet Spraying, on flow labels or on SRv6 paths with srcRoute)",
+                 "load balancing: mrc (ECMP / spray, or SRv6 active and backup EV sets), reps "
+                 "(Recycled Entropy Packet Spraying, on flow labels or on SRv6 paths with srcRoute) "
+                 "or plb (Protective Load Balancing: one flow label per plane, rehashed on "
+                 "persistent ECN; with srcRoute one SRv6 path per plane)",
                  lb);
     cmd.AddValue("evOnEcn", "srcRoute: an ECN mark switches paths", evOnEcn);
     cmd.AddValue("evOnLoss", "srcRoute: a trim NACK or an RTO switches paths", evOnLoss);
@@ -77,38 +85,93 @@ main(int argc, char* argv[])
     cmd.AddValue("degradeRate", "rate of a degraded T0-T1 link", degradeRate);
     cmd.AddValue("rate", "link rate of every plane", topo.linkRate);
     cmd.AddValue("delay", "delay of every link", topo.linkDelay);
+    cmd.AddValue("int", "INT telemetry version added by the T1 switches: 0 off, 1 queue length",
+                 intVersion);
+    cmd.AddValue("intLevels",
+                 "telemetry: queue levels, % of the port buffer, separated by + (run.sh sweeps commas); "
+                 "a snapshot each time a watched port crosses one",
+                 intLevels);
+    cmd.AddValue("intHysteresis",
+                 "telemetry: a port drops back below a level once its queue is this many % under it",
+                 intHysteresis);
+    cmd.AddValue("intLeaves",
+                 "INT: T0s that watch their uplinks (out and in): all | none | list of i (every plane) "
+                 "or p:i, separated by , or +",
+                 intLeaves);
+    cmd.AddValue("intAggs",
+                 "INT, fattree: aggregation switches that watch their core uplinks (out and in), same "
+                 "syntax as intLeaves (index within the plane)",
+                 intAggs);
     cmd.AddValue("stop", "simulated-time limit (s), a safeguard if messages never complete", stopTime);
     cmd.Parse(argc, argv);
+    if (!ResolveTopology())
+    {
+        return 1;
+    }
 
     if (mtuShift < 8 || mtuShift > 12)
     {
         std::cerr << "Unsupported mtuShift " << mtuShift << ". Use 8..12 (MTU 256..4096)." << std::endl;
         return 1;
     }
+    if (intVersion > IntHeader::VERSION_MAX)
+    {
+        std::cerr << "Unsupported --int=" << intVersion << ". Use 0 (off) or 1." << std::endl;
+        return 1;
+    }
+    if (intVersion != 0)
+    {
+        if (!ParseIntLevels())
+        {
+            return 1;
+        }
+        std::cout << "Telemetry levels (% of the port buffer): up";
+        for (double f : intLevelFractions)
+        {
+            std::cout << " " << f * 100;
+        }
+        std::cout << ", down";
+        for (double f : intLevelFractions)
+        {
+            std::cout << " " << f * 100 - intHysteresis;
+        }
+        std::cout << std::endl;
+    }
     Config::SetDefault("ns3::RdmaSender::MtuShift", UintegerValue(mtuShift));
     Config::SetDefault("ns3::RdmaSender::PacketSpraying", BooleanValue(spray));
     Config::SetDefault("ns3::RdmaSender::SourceRouting", BooleanValue(sourceRouting));
-    if (lb != "mrc" && lb != "reps")
+    if (lb != "mrc" && lb != "reps" && lb != "plb")
     {
-        std::cerr << "Unknown --lb=" << lb << ". Use mrc or reps." << std::endl;
+        std::cerr << "Unknown --lb=" << lb << ". Use mrc, reps or plb." << std::endl;
         return 1;
     }
-    Config::SetDefault("ns3::RdmaSender::LoadBalancing", StringValue(lb == "reps" ? "Reps" : "Mrc"));
+    Config::SetDefault("ns3::RdmaSender::LoadBalancing",
+                       StringValue(lb == "reps" ? "Reps" : lb == "plb" ? "Plb" : "Mrc"));
     Config::SetDefault("ns3::RdmaSender::EvOnEcn", BooleanValue(evOnEcn));
     Config::SetDefault("ns3::RdmaSender::EvOnLoss", BooleanValue(evOnLoss));
 
     std::string name = work.type == "trace" ? flowFile + "s" : work.type;
     std::filesystem::create_directories("logs");
+    std::string topoName = IsFatTree() ? "_FT" + std::to_string(topo.numT0PerPlane) + "xK" +
+                                             std::to_string(topo.k)
+                                       : "_T" + std::to_string(topo.numT0PerPlane) + "x" +
+                                             std::to_string(topo.numT1PerPlane);
     logFile = "logs/" + name + "_P" + std::to_string(topo.numPlanes) + "_S" +
-              std::to_string(topo.numServers) + "_T" + std::to_string(topo.numT0PerPlane) + "x" +
-              std::to_string(topo.numT1PerPlane) + "_PFC" +
+              std::to_string(topo.numServers) + topoName + "_PFC" +
               std::to_string(pfcVersion) + "_TRIM" + std::to_string(trimEnabled) +
-              (sourceRouting ? std::string("_SRV6") : "_SPRAY" + std::to_string(spray)) +
-              (lb == "reps" ? "_REPS" : "") + "_ECN" +
+              (sourceRouting ? std::string("_SRV6")
+                             : lb == "plb" ? std::string("_ECMP")
+                                           : "_SPRAY" + std::to_string(spray)) +
+              (lb == "reps" ? "_REPS" : lb == "plb" ? "_PLB" : "") + "_ECN" +
               std::to_string(ecnMarking) + (ecnAtDequeue ? "D" : "E") +
-              "_DEG" +
+              (intVersion ? "_INT" + std::to_string(intVersion) : "") + "_DEG" +
               std::to_string(degradeLinks) + "_MTU" + std::to_string(1u << mtuShift);
 
+    if (intVersion != 0 && !OpenIntLog(logFile + ".int"))
+    {
+        std::cerr << "Cannot open " << logFile << ".int" << std::endl;
+        return 1;
+    }
     BuildMultiPlane();
     BuildConnections();
     if (!OpenFctLog())
@@ -146,13 +209,14 @@ main(int argc, char* argv[])
               << " reorder losses (" << st.spuriousDetections << " spurious seen), " << st.trimNacks << " trim NACKs, " << st.evSwaps
               << " EV swaps (" << st.evRejoins << " rejoined), REPS " << st.repsRecycledEvs
               << " recycled / " << st.repsRandomEvs << " random EVs (" << st.repsExploreEvs << " exploring), "
-              << st.repsOverwritten << " overwritten"
-              << std::endl;
+              << st.repsOverwritten << " overwritten, PLB " << st.plbCongestedRounds
+              << " congested rounds / " << st.plbRepaths << " repaths (" << st.plbRtoRepaths
+              << " on RTO)" << std::endl;
     uint64_t drops = 0;
     uint64_t trims = 0;
     uint64_t marks = 0;
     int32_t maxQueue = 0;
-    for (auto* tier : {&t0s, &t1s})
+    for (auto* tier : {&t0s, &t1s, &t2s})
     {
         for (auto& plane : *tier)
         {
@@ -168,6 +232,11 @@ main(int argc, char* argv[])
     std::cout << "Switches: " << drops << " drops, " << trims << " trims, " << marks
               << " ECN marks, max queue " << maxQueue / 1000 << " KB. Fabric load:" << std::endl;
     PrintFabricLoad(std::cout);
+    if (intLogPtr != nullptr)
+    {
+        fclose(intLogPtr);
+        std::cout << "INT: " << intLogRows << " snapshots, log: " << logFile << ".int" << std::endl;
+    }
 
     std::chrono::duration<double> diff = std::chrono::system_clock::now() - start;
     std::cout << "Messages: " << numMessages << " on " << numQps << " QPs, FCT log: " << logFile

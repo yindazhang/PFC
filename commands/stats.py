@@ -7,7 +7,7 @@ Usage:
 
 Columns: data packets, retransmissions (% of packets), RTOs, trim NACKs, EV
 swaps (MRC SRv6), REPS random EVs, switch drops / trims / ECN marks / largest egress queue, T0->T1 load
-imbalance (max/mean bytes over all T0->T1 links), messages, and the wall-clock
+imbalance (max/mean bytes over all T0->T1 links; fat tree: ToR->Agg), messages, and the wall-clock
 time and peak memory of the run (time.txt, written by commands/run.sh).
 """
 import argparse
@@ -27,7 +27,7 @@ PATTERNS = {
     "trims": r"(\d+) trims",
     "ecnMarks": r"(\d+) ECN marks",
     "maxQueueKB": r"max queue (\d+) KB",
-    "imbalance": r"all T0->T1: .* max/mean ([\d.]+)",
+    "imbalance": r"all (?:T0->T1|ToR->Agg): .* max/mean ([\d.]+)",
     "messages": r"Messages: (\d+)",
 }
 
